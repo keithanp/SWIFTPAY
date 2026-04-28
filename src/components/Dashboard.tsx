@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   Area,
   AreaChart,
@@ -71,23 +71,36 @@ export function Dashboard({ onLogout, onHome }: DashboardProps) {
     return [...map.values()].sort((a, b) => a.date.localeCompare(b.date));
   }, []);
 
-  const fetchAdvisor = useCallback(async () => {
+  useEffect(() => {
     if (!isConnected) return;
+    let cancelled = false;
     setAdvisorLoading(true);
     setAdvisorText(null);
-    try {
-      const text = await getFinancialInsights(financials);
-      setAdvisorText(text);
-    } catch {
-      setAdvisorText('Unable to reach the advisor. Check your API key and try again.');
-    } finally {
-      setAdvisorLoading(false);
-    }
+    void (async () => {
+      try {
+        const text = await getFinancialInsights(financials);
+        if (!cancelled) setAdvisorText(text);
+      } catch {
+        if (!cancelled) {
+          setAdvisorText('Unable to reach the advisor. Check your API key and try again.');
+        }
+      } finally {
+        if (!cancelled) setAdvisorLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [financials, isConnected]);
 
   useEffect(() => {
-    void fetchAdvisor();
-  }, [fetchAdvisor]);
+    if (!modalOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setModalOpen(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [modalOpen]);
 
   const fee = Math.round(advanceAmount * ADVANCE_FEE_RATE * 100) / 100;
   const netAmount = Math.round((advanceAmount - fee) * 100) / 100;
@@ -425,15 +438,23 @@ export function Dashboard({ onLogout, onHome }: DashboardProps) {
       </main>
 
       {modalOpen && (
-        <div className="fixed inset-0 z-50 flex items-end justify-center bg-slate-900/40 p-4 sm:items-center">
+        <div
+          className="fixed inset-0 z-50 flex items-end justify-center bg-slate-900/40 p-4 sm:items-center"
+          onClick={() => setModalOpen(false)}
+          role="presentation"
+        >
           <div
             role="dialog"
             aria-modal="true"
+            aria-labelledby="advance-modal-title"
             className="w-full max-w-lg rounded-2xl border border-slate-200 bg-white p-6 shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-start justify-between gap-4">
               <div>
-                <h2 className="text-lg font-semibold text-slate-900">Request advance</h2>
+                <h2 id="advance-modal-title" className="text-lg font-semibold text-slate-900">
+                  Request advance
+                </h2>
                 <p className="mt-1 text-sm text-slate-500">Choose an amount up to your verified limit.</p>
               </div>
               <button

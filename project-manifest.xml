@@ -8,6 +8,9 @@
     <file path="vite.config.ts" />
     <file path="index.html" />
     <file path=".gitignore" />
+    <file path=".env.example" />
+    <file path="README.md" />
+    <file path=".github/workflows/ci.yml" />
     <file path="public/vite.svg" />
     <file path="src/vite-env.d.ts" />
     <file path="src/main.tsx" />
