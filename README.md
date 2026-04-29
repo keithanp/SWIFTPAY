@@ -31,6 +31,7 @@ npm install
 npm run build:packages
 npm run dev:api    # terminal 1
 npm run dev:worker # terminal 2
+npm run dev        # terminal 3 — UI; paste pipeline JWT on the gate screen (see docs/PIPELINE.md)
 ```
 
 ## Repository

@@ -15,14 +15,22 @@ npm install
 npm run build:packages
 ```
 
-3. Run API + worker (two terminals):
+3. Run API + worker + Vite UI:
 
 ```bash
 npm run dev:api
 npm run dev:worker
+npm run dev
 ```
 
 Environment defaults target `localhost` Postgres/Redis from `docker-compose.yml`.
+
+### Wire the website to the pipeline (local)
+
+1. Create a developer + JWT using the smoke-test commands below.
+2. Open the Vite app (default `http://localhost:5173`). On the **App Store Connect gate**, paste the JWT under **Pipeline API (dev)** and click **Save token**.
+3. Click **Connect & Verify Revenue** — the dashboard auto-loads **`GET /v1/dashboard/summary`** when a token is saved.
+4. Use **Sync from API** / **Run ingestion refresh** in the dashboard banner as needed.
 
 ### Important env vars
 

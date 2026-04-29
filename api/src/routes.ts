@@ -92,6 +92,58 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
     return { runs: r.rows };
   });
 
+  app.get('/v1/dashboard/summary', { preHandler: authMiddleware }, async (req, reply) => {
+    const { developerId } = (req as AuthedRequest).auth;
+
+    const lim = await pool.query(
+      `select id, computed_at, policy_version, max_advance_cents, recommended_advance_cents, confidence, staleness_hours, reason_codes, expires_at, inputs_snapshot_hash, explainability, ingestion_run_id
+       from limit_decisions where developer_id = $1 order by computed_at desc limit 1`,
+      [developerId],
+    );
+    if (lim.rowCount === 0) {
+      return reply.code(404).send({
+        error: 'no_limit_yet',
+        message: 'Run POST /v1/verification/refresh after ingestion completes.',
+      });
+    }
+
+    const feat = await pool.query<{ features: unknown }>(
+      `select features from feature_snapshots where developer_id = $1 order by computed_at desc limit 1`,
+      [developerId],
+    );
+
+    const ledger = await pool.query<{ date: string; netUsdCents: string }>(
+      `select revenue_date::text as date, sum(net_proceeds_cents)::text as "netUsdCents"
+       from revenue_daily
+       where developer_id = $1 and currency = 'USD'
+       group by revenue_date
+       order by revenue_date asc`,
+      [developerId],
+    );
+
+    const run = await pool.query(
+      `select id, status, finished_at, reports_stored, rows_parsed, error_message
+       from ingestion_runs where developer_id = $1 order by created_at desc limit 1`,
+      [developerId],
+    );
+
+    const d = lim.rows[0] as Record<string, unknown>;
+    const decision = {
+      ...d,
+      max_advance_cents: Number(d.max_advance_cents),
+      recommended_advance_cents: Number(d.recommended_advance_cents),
+      confidence: Number(d.confidence),
+      staleness_hours: Number(d.staleness_hours),
+    };
+
+    return {
+      decision,
+      features: feat.rows[0]?.features ?? null,
+      ledgerDaily: ledger.rows.map((r) => ({ date: r.date, netUsdCents: Number(r.netUsdCents) })),
+      latestRun: run.rows[0] ?? null,
+    };
+  });
+
   app.get('/v1/limits', { preHandler: authMiddleware }, async (req, reply) => {
     const { developerId } = (req as AuthedRequest).auth;
     const lim = await pool.query(

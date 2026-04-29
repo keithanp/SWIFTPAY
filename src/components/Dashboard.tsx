@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Area,
   AreaChart,
@@ -10,6 +10,13 @@ import {
 } from 'recharts';
 import { ADVANCE_FEE_RATE, INITIAL_TRANSACTIONS, MOCK_PROJECTED_REVENUE, MOCK_REVENUE_HISTORY } from '../constants';
 import { getFinancialInsights } from '../services/geminiService';
+import type { DashboardSummary } from '../pipelineTypes';
+import {
+  fetchDashboardSummary,
+  getPipelineJwt,
+  postVerificationRefresh,
+  setPipelineJwt,
+} from '../services/pipelineApi';
 import type { FinancialState, Transaction } from '../types';
 import {
   Activity,
@@ -40,6 +47,22 @@ function formatShortDate(iso: string): string {
 const nextBulk = new Date();
 nextBulk.setDate(nextBulk.getDate() + 38);
 
+function buildMockChartData() {
+  const map = new Map<string, { date: string; actual: number | null; projected: number | null }>();
+  for (const row of MOCK_REVENUE_HISTORY) {
+    map.set(row.date, { date: row.date, actual: row.revenue, projected: null });
+  }
+  for (const row of MOCK_PROJECTED_REVENUE) {
+    const existing = map.get(row.date);
+    if (existing) {
+      existing.projected = row.revenue;
+    } else {
+      map.set(row.date, { date: row.date, actual: null, projected: row.revenue });
+    }
+  }
+  return [...map.values()].sort((a, b) => a.date.localeCompare(b.date));
+}
+
 export function Dashboard({ onLogout, onHome }: DashboardProps) {
   const [isConnected, setIsConnected] = useState(false);
   const [connecting, setConnecting] = useState(false);
@@ -55,21 +78,122 @@ export function Dashboard({ onLogout, onHome }: DashboardProps) {
   const [advisorText, setAdvisorText] = useState<string | null>(null);
   const [advisorLoading, setAdvisorLoading] = useState(false);
 
-  const chartData = useMemo(() => {
-    const map = new Map<string, { date: string; actual: number | null; projected: number | null }>();
-    for (const row of MOCK_REVENUE_HISTORY) {
-      map.set(row.date, { date: row.date, actual: row.revenue, projected: null });
-    }
-    for (const row of MOCK_PROJECTED_REVENUE) {
-      const existing = map.get(row.date);
-      if (existing) {
-        existing.projected = row.revenue;
-      } else {
-        map.set(row.date, { date: row.date, actual: null, projected: row.revenue });
-      }
-    }
-    return [...map.values()].sort((a, b) => a.date.localeCompare(b.date));
+  const [pipelineJwtDraft, setPipelineJwtDraft] = useState('');
+  const [pipelineFromApi, setPipelineFromApi] = useState(false);
+  const [pipelineError, setPipelineError] = useState<string | null>(null);
+  const [pipelineBusy, setPipelineBusy] = useState(false);
+  const [pipelineRunHint, setPipelineRunHint] = useState<string | null>(null);
+  const [ledgerDaily, setLedgerDaily] = useState<{ date: string; netUsdCents: number }[] | null>(null);
+  const [pipelineMeta, setPipelineMeta] = useState<{
+    confidence: number;
+    policyVersion: string;
+    latestRunStatus: string | null;
+  } | null>(null);
+
+  useEffect(() => {
+    const existing = getPipelineJwt();
+    if (existing) setPipelineJwtDraft(existing);
   }, []);
+
+  const chartData = useMemo(() => {
+    if (ledgerDaily?.length) {
+      const map = new Map<string, { date: string; actual: number | null; projected: number | null }>();
+      for (const row of ledgerDaily) {
+        map.set(row.date, { date: row.date, actual: row.netUsdCents / 100, projected: null });
+      }
+      const last = ledgerDaily[ledgerDaily.length - 1]!.date;
+      for (const row of MOCK_PROJECTED_REVENUE) {
+        if (row.date > last) {
+          const existing = map.get(row.date);
+          if (existing) {
+            existing.projected = row.revenue;
+          } else {
+            map.set(row.date, { date: row.date, actual: null, projected: row.revenue });
+          }
+        }
+      }
+      return [...map.values()].sort((a, b) => a.date.localeCompare(b.date));
+    }
+    return buildMockChartData();
+  }, [ledgerDaily]);
+
+  const applySummary = useCallback((summary: DashboardSummary) => {
+    const maxUsd = summary.decision.max_advance_cents / 100;
+    const t28 = summary.features?.trailing_28d_net_usd_cents ?? 0;
+    const pendingUsd = t28 / 100;
+    setFinancials((prev) => ({
+      ...prev,
+      pendingAppleRevenue: pendingUsd > 0 ? pendingUsd : prev.pendingAppleRevenue,
+      availableAdvance: maxUsd,
+    }));
+    setLedgerDaily(summary.ledgerDaily);
+    setPipelineFromApi(true);
+    setPipelineError(null);
+    setPipelineMeta({
+      confidence: summary.decision.confidence,
+      policyVersion: summary.decision.policy_version,
+      latestRunStatus: summary.latestRun?.status ?? null,
+    });
+  }, []);
+
+  const syncFromPipeline = useCallback(async () => {
+    if (!getPipelineJwt()?.trim()) {
+      setPipelineError('Save a pipeline JWT first (from POST /v1/auth/token).');
+      return;
+    }
+    setPipelineBusy(true);
+    setPipelineError(null);
+    setPipelineRunHint(null);
+    try {
+      const summary = await fetchDashboardSummary();
+      applySummary(summary);
+    } catch (e) {
+      setPipelineFromApi(false);
+      setPipelineError((e as Error).message);
+    } finally {
+      setPipelineBusy(false);
+    }
+  }, [applySummary]);
+
+  const runIngestionRefresh = useCallback(async () => {
+    if (!getPipelineJwt()?.trim()) {
+      setPipelineError('Save a pipeline JWT first.');
+      return;
+    }
+    setPipelineBusy(true);
+    setPipelineError(null);
+    try {
+      await postVerificationRefresh();
+      setPipelineRunHint('Ingestion queued. Syncing in a few seconds…');
+      for (let i = 0; i < 45; i++) {
+        await new Promise((r) => setTimeout(r, 1000));
+        try {
+          const summary = await fetchDashboardSummary();
+          applySummary(summary);
+          if (summary.latestRun?.status === 'succeeded' || summary.latestRun?.status === 'failed') {
+            setPipelineRunHint(
+              summary.latestRun.status === 'succeeded'
+                ? 'Ingestion completed.'
+                : `Ingestion failed: ${summary.latestRun.error_message ?? 'unknown'}`,
+            );
+            break;
+          }
+        } catch {
+          /* still running */
+        }
+      }
+    } catch (e) {
+      setPipelineError((e as Error).message);
+    } finally {
+      setPipelineBusy(false);
+    }
+  }, [applySummary]);
+
+  useEffect(() => {
+    if (!isConnected) return;
+    if (!getPipelineJwt()?.trim()) return;
+    void syncFromPipeline();
+  }, [isConnected, syncFromPipeline]);
 
   useEffect(() => {
     if (!isConnected) return;
@@ -111,6 +235,26 @@ export function Dashboard({ onLogout, onHome }: DashboardProps) {
       setConnecting(false);
       setIsConnected(true);
     }, 2500);
+  };
+
+  const savePipelineJwt = () => {
+    setPipelineJwt(pipelineJwtDraft.trim() || null);
+    setPipelineError(null);
+  };
+
+  const clearPipelineJwt = () => {
+    setPipelineJwt(null);
+    setPipelineJwtDraft('');
+    setPipelineFromApi(false);
+    setLedgerDaily(null);
+    setPipelineMeta(null);
+    setPipelineRunHint(null);
+    setFinancials({
+      pendingAppleRevenue: 24_000,
+      availableAdvance: 18_500,
+      cashInBank: 42_200,
+      totalAdvanced: 0,
+    });
   };
 
   const clampAdvance = (v: number) =>
@@ -179,6 +323,47 @@ export function Dashboard({ onLogout, onHome }: DashboardProps) {
               Verify pending App Store revenue to unlock your dashboard, advances, and AI liquidity
               guidance.
             </p>
+
+            <div className="mt-8 rounded-xl border border-slate-200 bg-slate-50 p-4 text-left">
+              <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Pipeline API (dev)</p>
+              <p className="mt-1 text-xs text-slate-600">
+                Paste the JWT from <code className="rounded bg-white px-1">POST /v1/auth/token</code> so the
+                dashboard can load verified limits and revenue from the Swiftpay API (
+                <code className="rounded bg-white px-1">docs/PIPELINE.md</code>).
+              </p>
+              <label htmlFor="pipeline-jwt" className="mt-3 block text-xs font-medium text-slate-700">
+                Access token
+              </label>
+              <input
+                id="pipeline-jwt"
+                type="password"
+                autoComplete="off"
+                value={pipelineJwtDraft}
+                onChange={(e) => setPipelineJwtDraft(e.target.value)}
+                placeholder="eyJhbGciOi…"
+                className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 font-mono text-xs text-slate-900 outline-none ring-blue-600 focus:ring-2"
+              />
+              <div className="mt-2 flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  onClick={savePipelineJwt}
+                  className="rounded-lg bg-slate-900 px-3 py-1.5 text-xs font-semibold text-white hover:bg-slate-800"
+                >
+                  Save token
+                </button>
+                <button
+                  type="button"
+                  onClick={clearPipelineJwt}
+                  className="rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                >
+                  Clear
+                </button>
+              </div>
+              {getPipelineJwt() ? (
+                <p className="mt-2 text-xs font-medium text-emerald-700">Token saved in this browser.</p>
+              ) : null}
+            </div>
+
             <button
               type="button"
               disabled={connecting}
@@ -245,9 +430,48 @@ export function Dashboard({ onLogout, onHome }: DashboardProps) {
       </header>
 
       <main className="mx-auto max-w-6xl space-y-8 px-4 py-8 sm:px-6 lg:px-8">
+        <section className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm sm:p-5">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <h2 className="text-sm font-semibold text-slate-900">Verified revenue (API)</h2>
+              <p className="text-xs text-slate-500">
+                {pipelineFromApi
+                  ? `Loaded from pipeline · policy ${pipelineMeta?.policyVersion ?? '—'} · confidence ${pipelineMeta?.confidence ?? '—'} · last job ${pipelineMeta?.latestRunStatus ?? '—'}`
+                  : 'Save a JWT on the gate screen, then sync to replace demo numbers with Postgres-backed limits and ledger.'}
+              </p>
+              {pipelineRunHint ? <p className="mt-1 text-xs font-medium text-blue-700">{pipelineRunHint}</p> : null}
+              {pipelineError ? <p className="mt-1 text-xs font-medium text-red-600">{pipelineError}</p> : null}
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                disabled={pipelineBusy}
+                onClick={() => void syncFromPipeline()}
+                className="rounded-lg bg-blue-600 px-3 py-2 text-xs font-semibold text-white shadow-sm hover:bg-blue-700 disabled:opacity-60"
+              >
+                Sync from API
+              </button>
+              <button
+                type="button"
+                disabled={pipelineBusy}
+                onClick={() => void runIngestionRefresh()}
+                className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-800 shadow-sm hover:bg-slate-50 disabled:opacity-60"
+              >
+                Run ingestion refresh
+              </button>
+            </div>
+          </div>
+          <p className="mt-2 text-[11px] text-slate-400">
+            Chart “Historical” uses <code className="rounded bg-slate-50 px-1">revenue_daily</code> when synced;
+            projected tail stays demo-style.
+          </p>
+        </section>
+
         <div className="grid gap-6 lg:grid-cols-3">
           <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm lg:col-span-1">
-            <p className="text-sm font-medium text-slate-500">Pending payouts</p>
+            <p className="text-sm font-medium text-slate-500">
+              {pipelineFromApi ? 'Trailing 28d net (verified)' : 'Pending payouts'}
+            </p>
             <p className="mt-2 text-3xl font-bold tracking-tight text-slate-900">
               {formatMoney(financials.pendingAppleRevenue)}
             </p>
@@ -286,7 +510,9 @@ export function Dashboard({ onLogout, onHome }: DashboardProps) {
               {formatMoney(financials.cashInBank)}
               <TrendingUp className="h-6 w-6 text-emerald-600" aria-hidden />
             </p>
-            <p className="mt-3 text-xs text-slate-500">Operating balance · excludes pending Apple batch</p>
+            <p className="mt-3 text-xs text-slate-500">
+              {pipelineFromApi ? 'Demo balance (not from pipeline).' : 'Operating balance · excludes pending Apple batch'}
+            </p>
           </section>
         </div>
 
@@ -296,7 +522,11 @@ export function Dashboard({ onLogout, onHome }: DashboardProps) {
               <div className="flex items-center justify-between gap-4">
                 <div>
                   <h2 className="text-lg font-semibold text-slate-900">Revenue</h2>
-                  <p className="text-sm text-slate-500">Historical daily sales vs. projected pipeline</p>
+                  <p className="text-sm text-slate-500">
+                    {ledgerDaily?.length
+                      ? 'API ledger (USD) + demo projected tail'
+                      : 'Historical daily sales vs. projected pipeline (demo)'}
+                  </p>
                 </div>
                 <div className="flex items-center gap-4 text-xs font-medium">
                   <span className="flex items-center gap-1.5 text-slate-600">
