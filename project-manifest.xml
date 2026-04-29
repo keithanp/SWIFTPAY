@@ -11,6 +11,14 @@
     <file path=".env.example" />
     <file path="README.md" />
     <file path=".github/workflows/ci.yml" />
+    <file path="ARCHITECTURE.md" />
+    <file path="docker-compose.yml" />
+    <file path="db/migrations/001_init.sql" />
+    <file path="docs/PIPELINE.md" />
+    <file path="api/package.json" />
+    <file path="worker/package.json" />
+    <file path="packages/core/package.json" />
+    <file path="packages/policy/package.json" />
     <file path="public/vite.svg" />
     <file path="src/vite-env.d.ts" />
     <file path="src/main.tsx" />

@@ -3,10 +3,21 @@
   "private": true,
   "version": "0.0.1",
   "type": "module",
+  "workspaces": [
+    "api",
+    "worker",
+    "packages/*"
+  ],
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "build:packages": "npm run build -w @swiftpay/core && npm run build -w @swiftpay/policy",
+    "test:packages": "npm run test -w @swiftpay/core && npm run test -w @swiftpay/policy",
+    "dev:api": "npm run build:packages && npm run dev -w api",
+    "dev:worker": "npm run build:packages && npm run dev -w worker",
+    "migrate": "npm run build:packages && npm run migrate -w api",
+    "build:all": "npm run build:packages && npm run build -w api && npm run build -w worker && npm run build"
   },
   "dependencies": {
     "@google/genai": "^1.50.1",

@@ -16,6 +16,23 @@ npm run dev
 
 The advisor calls **Gemini 2.5 Flash** in the browser. Treat API keys as sensitive; prefer a small backend proxy for real products.
 
+## Revenue verification pipeline (backend)
+
+Monorepo workspaces add `api/` (Fastify + Postgres + BullMQ), `worker/` (ingest jobs), and `packages/{core,policy}`.
+
+- **Architecture:** [ARCHITECTURE.md](./ARCHITECTURE.md)
+- **Runbook / smoke tests:** [docs/PIPELINE.md](./docs/PIPELINE.md)
+
+Quick start:
+
+```bash
+docker compose up -d
+npm install
+npm run build:packages
+npm run dev:api    # terminal 1
+npm run dev:worker # terminal 2
+```
+
 ## Repository
 
 https://github.com/keithanp/SWIFTPAY
