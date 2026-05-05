@@ -10,11 +10,19 @@ import {
 } from 'recharts';
 import { ADVANCE_FEE_RATE, INITIAL_TRANSACTIONS, MOCK_PROJECTED_REVENUE, MOCK_REVENUE_HISTORY } from '../constants';
 import { getFinancialInsights } from '../services/geminiService';
-import type { DashboardSummary } from '../pipelineTypes';
+import type { AdvanceRow, DashboardSummary, PayoutProfile, PricingTransparency } from '../pipelineTypes';
 import {
+  fetchAdvances,
   fetchDashboardSummary,
+  fetchPayoutProfile,
+  fetchPricingTransparency,
   getPipelineJwt,
+  postAdvance,
+  postAdvanceTransition,
+  postPayoutVerifyStub,
   postVerificationRefresh,
+  putKycChecklist,
+  putPayoutProfile,
   setPipelineJwt,
 } from '../services/pipelineApi';
 import type { FinancialState, Transaction } from '../types';
@@ -24,6 +32,7 @@ import {
   CreditCard,
   LayoutDashboard,
   LogOut,
+  Shield,
   Sparkles,
   TrendingUp,
   Wallet,
@@ -90,6 +99,33 @@ export function Dashboard({ onLogout, onHome }: DashboardProps) {
     latestRunStatus: string | null;
   } | null>(null);
 
+  const [payoutProfile, setPayoutProfile] = useState<PayoutProfile | null>(null);
+  const [pricing, setPricing] = useState<PricingTransparency | null>(null);
+  const [advances, setAdvances] = useState<AdvanceRow[]>([]);
+  const [payoutDraft, setPayoutDraft] = useState({ bankDisplayName: '', accountLast4: '', routingLast4: '' });
+  const [advanceActionId, setAdvanceActionId] = useState<string | null>(null);
+
+  const loadPipelineAux = useCallback(async () => {
+    if (!getPipelineJwt()?.trim()) return;
+    try {
+      const [p, pr, a] = await Promise.all([
+        fetchPayoutProfile(),
+        fetchPricingTransparency(),
+        fetchAdvances(),
+      ]);
+      setPayoutProfile(p);
+      setPricing(pr);
+      setAdvances(a.advances);
+      setPayoutDraft({
+        bankDisplayName: p.bankDisplayName,
+        accountLast4: p.accountLast4 ?? '',
+        routingLast4: p.routingLast4 ?? '',
+      });
+    } catch {
+      /* non-fatal: dashboard summary may still work */
+    }
+  }, []);
+
   useEffect(() => {
     const existing = getPipelineJwt();
     if (existing) setPipelineJwtDraft(existing);
@@ -118,13 +154,16 @@ export function Dashboard({ onLogout, onHome }: DashboardProps) {
   }, [ledgerDaily]);
 
   const applySummary = useCallback((summary: DashboardSummary) => {
-    const maxUsd = summary.decision.max_advance_cents / 100;
+    const availCents = summary.availableAfterAdvancesCents ?? summary.decision.max_advance_cents;
+    const availUsd = availCents / 100;
     const t28 = summary.features?.trailing_28d_net_usd_cents ?? 0;
     const pendingUsd = t28 / 100;
+    const outstandingUsd = (summary.outstandingAdvanceCents ?? 0) / 100;
     setFinancials((prev) => ({
       ...prev,
       pendingAppleRevenue: pendingUsd > 0 ? pendingUsd : prev.pendingAppleRevenue,
-      availableAdvance: maxUsd,
+      availableAdvance: availUsd,
+      totalAdvanced: outstandingUsd > 0 ? outstandingUsd : prev.totalAdvanced,
     }));
     setLedgerDaily(summary.ledgerDaily);
     setPipelineFromApi(true);
@@ -147,13 +186,14 @@ export function Dashboard({ onLogout, onHome }: DashboardProps) {
     try {
       const summary = await fetchDashboardSummary();
       applySummary(summary);
+      await loadPipelineAux();
     } catch (e) {
       setPipelineFromApi(false);
       setPipelineError((e as Error).message);
     } finally {
       setPipelineBusy(false);
     }
-  }, [applySummary]);
+  }, [applySummary, loadPipelineAux]);
 
   const runIngestionRefresh = useCallback(async () => {
     if (!getPipelineJwt()?.trim()) {
@@ -182,12 +222,13 @@ export function Dashboard({ onLogout, onHome }: DashboardProps) {
           /* still running */
         }
       }
+      await loadPipelineAux();
     } catch (e) {
       setPipelineError((e as Error).message);
     } finally {
       setPipelineBusy(false);
     }
-  }, [applySummary]);
+  }, [applySummary, loadPipelineAux]);
 
   useEffect(() => {
     if (!isConnected) return;
@@ -249,6 +290,9 @@ export function Dashboard({ onLogout, onHome }: DashboardProps) {
     setLedgerDaily(null);
     setPipelineMeta(null);
     setPipelineRunHint(null);
+    setPayoutProfile(null);
+    setPricing(null);
+    setAdvances([]);
     setFinancials({
       pendingAppleRevenue: 24_000,
       availableAdvance: 18_500,
@@ -263,26 +307,62 @@ export function Dashboard({ onLogout, onHome }: DashboardProps) {
   const handleConfirmAdvance = () => {
     const amount = clampAdvance(advanceAmount);
     if (amount <= 0) return;
-    const f = Math.round(amount * ADVANCE_FEE_RATE * 100) / 100;
-    const net = Math.round((amount - f) * 100) / 100;
-    const tx: Transaction = {
-      id: `tx-${Date.now()}`,
-      type: 'advance',
-      amount: net,
-      date: new Date().toISOString().slice(0, 10),
-      status: 'completed',
-      description: 'Swiftpay advance (net deposit)',
-    };
-    const newAvailable = Math.round((financials.availableAdvance - amount) * 100) / 100;
-    setTransactions((prev) => [tx, ...prev]);
-    setFinancials((prev) => ({
-      ...prev,
-      cashInBank: Math.round((prev.cashInBank + net) * 100) / 100,
-      availableAdvance: newAvailable,
-      totalAdvanced: Math.round((prev.totalAdvanced + amount) * 100) / 100,
-    }));
-    setModalOpen(false);
-    setAdvanceAmount(Math.min(5_000, Math.max(0, newAvailable)));
+
+    void (async () => {
+      if (getPipelineJwt()?.trim()) {
+        setPipelineBusy(true);
+        setPipelineError(null);
+        try {
+          const amountCents = Math.round(amount * 100);
+          const res = await postAdvance({ amountCents });
+          const netUsd = res.netCents / 100;
+          const tx: Transaction = {
+            id: res.id,
+            type: 'advance',
+            amount: netUsd,
+            date: new Date().toISOString().slice(0, 10),
+            status: 'pending',
+            description: `Advance requested (${res.status})`,
+          };
+          setTransactions((prev) => [tx, ...prev]);
+          setFinancials((prev) => ({
+            ...prev,
+            cashInBank: Math.round((prev.cashInBank + netUsd) * 100) / 100,
+          }));
+          const summary = await fetchDashboardSummary();
+          applySummary(summary);
+          await loadPipelineAux();
+          setModalOpen(false);
+          setAdvanceAmount(Math.min(5_000, Math.max(0, (summary.availableAfterAdvancesCents ?? 0) / 100)));
+        } catch (e) {
+          setPipelineError((e as Error).message);
+        } finally {
+          setPipelineBusy(false);
+        }
+        return;
+      }
+
+      const f = Math.round(amount * ADVANCE_FEE_RATE * 100) / 100;
+      const net = Math.round((amount - f) * 100) / 100;
+      const tx: Transaction = {
+        id: `tx-${Date.now()}`,
+        type: 'advance',
+        amount: net,
+        date: new Date().toISOString().slice(0, 10),
+        status: 'completed',
+        description: 'Swiftpay advance (net deposit)',
+      };
+      const newAvailable = Math.round((financials.availableAdvance - amount) * 100) / 100;
+      setTransactions((prev) => [tx, ...prev]);
+      setFinancials((prev) => ({
+        ...prev,
+        cashInBank: Math.round((prev.cashInBank + net) * 100) / 100,
+        availableAdvance: newAvailable,
+        totalAdvanced: Math.round((prev.totalAdvanced + amount) * 100) / 100,
+      }));
+      setModalOpen(false);
+      setAdvanceAmount(Math.min(5_000, Math.max(0, newAvailable)));
+    })();
   };
 
   const iconForType = (t: Transaction['type']) => {
@@ -466,6 +546,299 @@ export function Dashboard({ onLogout, onHome }: DashboardProps) {
             projected tail stays demo-style.
           </p>
         </section>
+
+        {getPipelineJwt()?.trim() ? (
+          <div className="grid gap-6 lg:grid-cols-2">
+            <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+              <div className="flex items-center gap-2">
+                <Shield className="h-5 w-5 text-blue-600" />
+                <h2 className="text-lg font-semibold text-slate-900">Payout destination (stub)</h2>
+              </div>
+              <p className="mt-2 text-sm text-slate-600">
+                Where advances land once funded. Values are stored server-side; this is not a live bank link.
+              </p>
+              <div className="mt-4 space-y-3">
+                <div>
+                  <label className="text-xs font-medium text-slate-500">Bank display name</label>
+                  <input
+                    value={payoutDraft.bankDisplayName}
+                    onChange={(e) => setPayoutDraft((d) => ({ ...d, bankDisplayName: e.target.value }))}
+                    className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm"
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="text-xs font-medium text-slate-500">Routing last 4</label>
+                    <input
+                      value={payoutDraft.routingLast4}
+                      onChange={(e) => setPayoutDraft((d) => ({ ...d, routingLast4: e.target.value.slice(0, 4) }))}
+                      className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-xs font-medium text-slate-500">Account last 4</label>
+                    <input
+                      value={payoutDraft.accountLast4}
+                      onChange={(e) => setPayoutDraft((d) => ({ ...d, accountLast4: e.target.value.slice(0, 4) }))}
+                      className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm"
+                    />
+                  </div>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    disabled={pipelineBusy}
+                    onClick={() =>
+                      void (async () => {
+                        setPipelineBusy(true);
+                        try {
+                          const p = await putPayoutProfile({
+                            bankDisplayName: payoutDraft.bankDisplayName,
+                            routingLast4: payoutDraft.routingLast4 || undefined,
+                            accountLast4: payoutDraft.accountLast4 || undefined,
+                          });
+                          setPayoutProfile((prev) => (prev ? { ...prev, ...p } : p));
+                        } catch (e) {
+                          setPipelineError((e as Error).message);
+                        } finally {
+                          setPipelineBusy(false);
+                        }
+                      })()
+                    }
+                    className="rounded-lg bg-slate-900 px-3 py-2 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-50"
+                  >
+                    Save payout stub
+                  </button>
+                  <button
+                    type="button"
+                    disabled={pipelineBusy}
+                    onClick={() =>
+                      void (async () => {
+                        setPipelineBusy(true);
+                        try {
+                          await postPayoutVerifyStub();
+                          const p = await fetchPayoutProfile();
+                          setPayoutProfile(p);
+                        } catch (e) {
+                          setPipelineError((e as Error).message);
+                        } finally {
+                          setPipelineBusy(false);
+                        }
+                      })()
+                    }
+                    className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-800 hover:bg-slate-50 disabled:opacity-50"
+                  >
+                    Stub: mark verified
+                  </button>
+                </div>
+                <p className="text-xs font-medium text-slate-600">
+                  Verification:{' '}
+                  <span className="text-blue-700">{payoutProfile?.verificationState ?? '—'}</span>
+                </p>
+              </div>
+
+              <div className="mt-8 border-t border-slate-100 pt-6">
+                <h3 className="text-sm font-semibold text-slate-900">KYC checklist (stub)</h3>
+                <ul className="mt-3 space-y-2">
+                  {(
+                    [
+                      ['govId', 'Government-issued ID'],
+                      ['proofOfAddress', 'Proof of address (≤90 days)'],
+                      ['beneficialOwners', 'Beneficial owners attestation'],
+                      ['bankLinkAuthorized', 'Bank linking authorization'],
+                    ] as const
+                  ).map(([key, label]) => (
+                    <li key={key} className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        className="h-4 w-4 rounded border-slate-300"
+                        checked={Boolean(payoutProfile?.kycChecklist?.[key])}
+                        disabled={pipelineBusy || !payoutProfile}
+                        onChange={() =>
+                          void (async () => {
+                            if (!payoutProfile) return;
+                            setPipelineBusy(true);
+                            try {
+                              const cur = payoutProfile.kycChecklist[key];
+                              const r = await putKycChecklist({ [key]: !cur } as Partial<PayoutProfile['kycChecklist']>);
+                              setPayoutProfile({
+                                ...payoutProfile,
+                                kycChecklist: r.kycChecklist,
+                                verificationState: r.verificationState,
+                              });
+                            } catch (e) {
+                              setPipelineError((e as Error).message);
+                            } finally {
+                              setPipelineBusy(false);
+                            }
+                          })()
+                        }
+                      />
+                      <span className="text-sm text-slate-700">{label}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            </section>
+
+            <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+              <h2 className="text-lg font-semibold text-slate-900">Pricing transparency</h2>
+              {pricing ? (
+                <div className="mt-3 space-y-4 text-sm text-slate-600">
+                  <div>
+                    <p className="font-semibold text-slate-900">Fee schedule</p>
+                    <p className="mt-1">
+                      Advance fee: <span className="font-medium">{pricing.feeSchedule.advanceFeeRatePercent}%</span> of
+                      gross advance ({pricing.feeSchedule.feeRateBps} bps).
+                    </p>
+                    <ul className="mt-2 list-inside list-disc text-xs">
+                      {pricing.feeSchedule.notes.map((n) => (
+                        <li key={n}>{n}</li>
+                      ))}
+                    </ul>
+                  </div>
+                  <div>
+                    <p className="font-semibold text-slate-900">Illustrative APR range</p>
+                    <p className="mt-1 text-xs">{pricing.appleDelayAssumptions.copy}</p>
+                    <p className="mt-2 font-mono text-xs text-slate-700">
+                      ~{pricing.illustrativeApr.aprPercentAt35DayHold}% APR proxy @ {pricing.appleDelayAssumptions.impliedHoldDaysMin}d hold · ~
+                      {pricing.illustrativeApr.aprPercentAt65DayHold}% @ {pricing.appleDelayAssumptions.impliedHoldDaysMax}d hold
+                    </p>
+                    <p className="mt-1 text-[11px] text-slate-500">{pricing.illustrativeApr.formula}</p>
+                  </div>
+                  <div>
+                    <p className="font-semibold text-slate-900">{pricing.chargebacksAndDelays.title}</p>
+                    <ul className="mt-2 list-inside list-disc text-xs">
+                      {pricing.chargebacksAndDelays.bullets.map((b) => (
+                        <li key={b}>{b}</li>
+                      ))}
+                    </ul>
+                  </div>
+                  {pricing.activeReasonCodes.length > 0 ? (
+                    <div className="rounded-lg border border-amber-100 bg-amber-50 p-3">
+                      <p className="text-xs font-semibold text-amber-900">Active policy signals</p>
+                      <ul className="mt-2 space-y-1 text-xs text-amber-950">
+                        {pricing.activeReasonCodes.map((c) => (
+                          <li key={c}>
+                            <span className="font-mono">{c}</span>: {pricing.reasonCodeDisclosures[c] ?? '—'}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  ) : (
+                    <p className="text-xs text-slate-500">No active underwriting reason codes on the latest limit.</p>
+                  )}
+                </div>
+              ) : (
+                <p className="mt-3 text-sm text-slate-500">Sync from API to load pricing disclosures.</p>
+              )}
+            </section>
+          </div>
+        ) : null}
+
+        {getPipelineJwt()?.trim() ? (
+          <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+            <h2 className="text-lg font-semibold text-slate-900">Advances (lifecycle)</h2>
+            <p className="mt-1 text-sm text-slate-500">
+              Immutable server records with audit events. Use stub actions to simulate funding and repayment.
+            </p>
+            <div className="mt-4 overflow-x-auto">
+              <table className="w-full min-w-[640px] text-left text-sm">
+                <thead>
+                  <tr className="border-b border-slate-200 text-xs uppercase tracking-wide text-slate-500">
+                    <th className="py-2 pr-3">Created</th>
+                    <th className="py-2 pr-3">Amount</th>
+                    <th className="py-2 pr-3">Fee</th>
+                    <th className="py-2 pr-3">Net</th>
+                    <th className="py-2 pr-3">APR proxy</th>
+                    <th className="py-2 pr-3">Status</th>
+                    <th className="py-2">Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {advances.length === 0 ? (
+                    <tr>
+                      <td colSpan={7} className="py-6 text-center text-slate-500">
+                        No advances yet — request one via “Get Funds Instantly”.
+                      </td>
+                    </tr>
+                  ) : (
+                    advances.map((a) => (
+                      <tr key={a.id} className="border-b border-slate-100">
+                        <td className="py-2 pr-3 text-xs text-slate-600">
+                          {new Date(a.createdAt).toLocaleString()}
+                        </td>
+                        <td className="py-2 pr-3 tabular-nums">{formatMoney(a.amountCents / 100)}</td>
+                        <td className="py-2 pr-3 tabular-nums">{formatMoney(a.feeCents / 100)}</td>
+                        <td className="py-2 pr-3 tabular-nums text-emerald-700">{formatMoney(a.netCents / 100)}</td>
+                        <td className="py-2 pr-3 text-xs">
+                          {a.effectiveAprProxyBps != null ? `${(a.effectiveAprProxyBps / 100).toFixed(1)}%` : '—'}
+                        </td>
+                        <td className="py-2 pr-3">
+                          <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-800">
+                            {a.status}
+                          </span>
+                        </td>
+                        <td className="py-2">
+                          <div className="flex flex-wrap gap-1">
+                            {a.status === 'requested' ? (
+                              <button
+                                type="button"
+                                disabled={advanceActionId === a.id}
+                                onClick={() =>
+                                  void (async () => {
+                                    setAdvanceActionId(a.id);
+                                    try {
+                                      await postAdvanceTransition(a.id, 'funded');
+                                      await loadPipelineAux();
+                                      const s = await fetchDashboardSummary();
+                                      applySummary(s);
+                                    } catch (e) {
+                                      setPipelineError((e as Error).message);
+                                    } finally {
+                                      setAdvanceActionId(null);
+                                    }
+                                  })()
+                                }
+                                className="rounded bg-blue-600 px-2 py-1 text-[11px] font-semibold text-white disabled:opacity-50"
+                              >
+                                Simulate fund
+                              </button>
+                            ) : null}
+                            {a.status === 'funded' ? (
+                              <button
+                                type="button"
+                                disabled={advanceActionId === a.id}
+                                onClick={() =>
+                                  void (async () => {
+                                    setAdvanceActionId(a.id);
+                                    try {
+                                      await postAdvanceTransition(a.id, 'repaid');
+                                      await loadPipelineAux();
+                                      const s = await fetchDashboardSummary();
+                                      applySummary(s);
+                                    } catch (e) {
+                                      setPipelineError((e as Error).message);
+                                    } finally {
+                                      setAdvanceActionId(null);
+                                    }
+                                  })()
+                                }
+                                className="rounded bg-emerald-600 px-2 py-1 text-[11px] font-semibold text-white disabled:opacity-50"
+                              >
+                                Simulate repay
+                              </button>
+                            ) : null}
+                          </div>
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </section>
+        ) : null}
 
         <div className="grid gap-6 lg:grid-cols-3">
           <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm lg:col-span-1">

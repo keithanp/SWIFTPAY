@@ -7,6 +7,7 @@ import { pool } from './db.js';
 import { assertDeveloperExists, authMiddleware, hashApiSecret, signToken, verifyApiSecret } from './auth.js';
 import { ingestQueue } from './queue.js';
 import { config } from './config.js';
+import { registerPayoutAdvancePricingRoutes } from './payoutAdvanceRoutes.js';
 
 type AuthedRequest = FastifyRequest & { auth: { developerId: string } };
 
@@ -127,10 +128,18 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
       [developerId],
     );
 
+    const advAgg = await pool.query<{ s: string }>(
+      `select coalesce(sum(amount_cents),0)::text as s from advances
+       where developer_id = $1 and status in ('requested','funded')`,
+      [developerId],
+    );
+    const outstandingAdvanceCents = Number(advAgg.rows[0]!.s);
+
     const d = lim.rows[0] as Record<string, unknown>;
+    const maxCents = Number(d.max_advance_cents);
     const decision = {
       ...d,
-      max_advance_cents: Number(d.max_advance_cents),
+      max_advance_cents: maxCents,
       recommended_advance_cents: Number(d.recommended_advance_cents),
       confidence: Number(d.confidence),
       staleness_hours: Number(d.staleness_hours),
@@ -141,6 +150,8 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
       features: feat.rows[0]?.features ?? null,
       ledgerDaily: ledger.rows.map((r) => ({ date: r.date, netUsdCents: Number(r.netUsdCents) })),
       latestRun: run.rows[0] ?? null,
+      outstandingAdvanceCents,
+      availableAfterAdvancesCents: Math.max(0, maxCents - outstandingAdvanceCents),
     };
   });
 
@@ -171,4 +182,6 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
       return { base, entries: [] };
     }
   });
+
+  await registerPayoutAdvancePricingRoutes(app);
 }

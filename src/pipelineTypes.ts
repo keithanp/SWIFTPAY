@@ -28,4 +28,56 @@ export type DashboardSummary = {
     rows_parsed: number;
     error_message: string | null;
   } | null;
+  outstandingAdvanceCents: number;
+  availableAfterAdvancesCents: number;
+};
+
+export type PayoutProfile = {
+  bankDisplayName: string;
+  accountLast4: string | null;
+  routingLast4: string | null;
+  currency: string;
+  verificationState: string;
+  kycChecklist: {
+    govId: boolean;
+    proofOfAddress: boolean;
+    beneficialOwners: boolean;
+    bankLinkAuthorized: boolean;
+  };
+  updatedAt?: string;
+};
+
+export type PricingTransparency = {
+  feeSchedule: {
+    advanceFeeRatePercent: number;
+    feeRateBps: number;
+    notes: string[];
+  };
+  appleDelayAssumptions: { impliedHoldDaysMin: number; impliedHoldDaysMax: number; copy: string };
+  illustrativeApr: {
+    basisPointsAt35DayHold: number;
+    basisPointsAt65DayHold: number;
+    aprPercentAt35DayHold: string;
+    aprPercentAt65DayHold: string;
+    formula: string;
+  };
+  chargebacksAndDelays: { title: string; bullets: string[] };
+  activeReasonCodes: string[];
+  reasonCodeDisclosures: Record<string, string>;
+};
+
+export type AdvanceRow = {
+  id: string;
+  amountCents: number;
+  feeCents: number;
+  netCents: number;
+  status: string;
+  limitDecisionId: string | null;
+  ingestionRunId: string | null;
+  feeRateBps: number;
+  impliedHoldDays: number;
+  effectiveAprProxyBps: number | null;
+  createdAt: string;
+  fundedAt: string | null;
+  repaidAt: string | null;
 };
