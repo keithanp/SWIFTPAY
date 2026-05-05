@@ -1,18 +1,18 @@
+import { createHash, randomUUID } from 'node:crypto';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
+import {
+  ADVANCE_FEE_RATE_BPS,
+  IMPLIED_HOLD_DAYS_DEFAULT,
+  IMPLIED_HOLD_DAYS_MAX,
+  REASON_CODE_DISCLOSURES,
+  aprProxyBps,
+  computeAdvanceQuote,
+} from '@swiftpay/policy';
+import type { PoolClient } from 'pg';
 import { pool } from './db.js';
 import { authMiddleware } from './auth.js';
 
 type AuthedRequest = FastifyRequest & { auth: { developerId: string } };
-
-const FEE_RATE_BPS = 300;
-const IMPLIED_HOLD_DAYS_DEFAULT = 35;
-const IMPLIED_HOLD_DAYS_MAX = 65;
-
-function aprProxyBps(feeCents: number, principalCents: number, holdDays: number): number {
-  if (principalCents <= 0 || holdDays <= 0) return 0;
-  const feeRatio = feeCents / principalCents;
-  return Math.round(feeRatio * (365 / holdDays) * 10_000);
-}
 
 async function ensurePayoutRow(developerId: string) {
   const r = await pool.query(`select * from payout_accounts where developer_id = $1`, [developerId]);
@@ -27,6 +27,111 @@ async function ensurePayoutRow(developerId: string) {
     ).rows[0]!;
   }
   return r.rows[0]!;
+}
+
+function requestHash(body: unknown, extra: unknown): string {
+  return createHash('sha256').update(JSON.stringify({ body, extra })).digest('hex');
+}
+
+async function beginIdempotent(
+  developerId: string,
+  endpoint: string,
+  idempotencyKey: string,
+  reqHash: string,
+): Promise<{ replay: boolean; code?: number; body?: unknown }> {
+  const ins = await pool.query(
+    `insert into idempotency_keys (developer_id, endpoint, idempotency_key, request_hash)
+     values ($1,$2,$3,$4)
+     on conflict (developer_id, endpoint, idempotency_key) do nothing`,
+    [developerId, endpoint, idempotencyKey, reqHash],
+  );
+  if (ins.rowCount === 1) return { replay: false };
+
+  const existing = await pool.query<{
+    request_hash: string;
+    status: string;
+    response_code: number | null;
+    response_body: unknown;
+  }>(
+    `select request_hash, status, response_code, response_body
+     from idempotency_keys
+     where developer_id = $1 and endpoint = $2 and idempotency_key = $3`,
+    [developerId, endpoint, idempotencyKey],
+  );
+  if (existing.rowCount !== 1) return { replay: false };
+  const row = existing.rows[0]!;
+  if (row.request_hash !== reqHash) {
+    return {
+      replay: true,
+      code: 409,
+      body: { error: 'idempotency_key_reused_with_different_payload' },
+    };
+  }
+  if (row.status === 'completed' && row.response_code != null) {
+    return { replay: true, code: row.response_code, body: row.response_body };
+  }
+  return { replay: true, code: 409, body: { error: 'idempotent_request_in_progress' } };
+}
+
+async function finishIdempotent(
+  developerId: string,
+  endpoint: string,
+  idempotencyKey: string,
+  responseCode: number,
+  body: unknown,
+): Promise<void> {
+  await pool.query(
+    `update idempotency_keys
+     set status = 'completed', response_code = $4, response_body = $5::jsonb, updated_at = now()
+     where developer_id = $1 and endpoint = $2 and idempotency_key = $3`,
+    [developerId, endpoint, idempotencyKey, responseCode, JSON.stringify(body)],
+  );
+}
+
+async function failIdempotent(
+  developerId: string,
+  endpoint: string,
+  idempotencyKey: string,
+  err: unknown,
+): Promise<void> {
+  await pool.query(
+    `update idempotency_keys
+     set status = 'failed', response_code = 500,
+         response_body = $4::jsonb, updated_at = now()
+     where developer_id = $1 and endpoint = $2 and idempotency_key = $3`,
+    [developerId, endpoint, idempotencyKey, JSON.stringify({ error: (err as Error).message ?? 'internal_error' })],
+  );
+}
+
+function getIdempotencyKey(req: FastifyRequest): string | null {
+  const header = req.headers['idempotency-key'];
+  if (typeof header !== 'string') return null;
+  const trimmed = header.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function dayIso(d: Date): string {
+  return d.toISOString().slice(0, 10);
+}
+
+async function postStubDisbursement(
+  client: PoolClient,
+  advanceId: string,
+  developerId: string,
+  amountCents: number,
+): Promise<{ ok: true; externalTransferId: string } | { ok: false; failureCode: string; failureMessage: string }> {
+  const transferId = `stub_tr_${randomUUID()}`;
+  await client.query(
+    `insert into payout_disbursements (advance_id, developer_id, provider, status, amount_cents, external_transfer_id, posted_at)
+     values ($1,$2,'internal_stub','posted',$3,$4,now())
+     on conflict (advance_id) do update set
+       status = excluded.status,
+       amount_cents = excluded.amount_cents,
+       external_transfer_id = excluded.external_transfer_id,
+       posted_at = excluded.posted_at`,
+    [advanceId, developerId, amountCents, transferId],
+  );
+  return { ok: true, externalTransferId: transferId };
 }
 
 export async function registerPayoutAdvancePricingRoutes(app: FastifyInstance): Promise<void> {
@@ -140,22 +245,14 @@ export async function registerPayoutAdvancePricingRoutes(app: FastifyInstance): 
     );
     const activeReasons = lim.rows[0]?.reason_codes ?? [];
 
-    const disclosures: Record<string, string> = {
-      NO_LEDGER_DATA: 'No verified Apple ledger yet — advances are unavailable until ingestion succeeds.',
-      SPARSE_28D_WINDOW: 'Fewer than 20 days of recent revenue — limit confidence is reduced.',
-      HIGH_VOLATILITY: 'Revenue swings increased risk — max advance is haircut until stability improves.',
-      STALE_LEDGER: 'Ledger is older than expected — limits may understate true risk until refreshed.',
-      ELEVATED_REFUND_PROXY: 'Refund pressure signal reduced the advance cap.',
-    };
-
-    const feeOn100Usd = Math.round(100_00 * (FEE_RATE_BPS / 10_000));
+    const feeOn100Usd = Math.round(100_00 * (ADVANCE_FEE_RATE_BPS / 10_000));
     const aprAt35 = aprProxyBps(feeOn100Usd, 100_00, IMPLIED_HOLD_DAYS_DEFAULT);
     const aprAt65 = aprProxyBps(feeOn100Usd, 100_00, IMPLIED_HOLD_DAYS_MAX);
 
     return {
       feeSchedule: {
-        advanceFeeRatePercent: FEE_RATE_BPS / 100,
-        feeRateBps: FEE_RATE_BPS,
+        advanceFeeRatePercent: ADVANCE_FEE_RATE_BPS / 100,
+        feeRateBps: ADVANCE_FEE_RATE_BPS,
         notes: [
           'Fee is assessed on gross advance amount at funding.',
           'Net proceeds are deposited after the fee is withheld.',
@@ -183,7 +280,9 @@ export async function registerPayoutAdvancePricingRoutes(app: FastifyInstance): 
         ],
       },
       activeReasonCodes: activeReasons,
-      reasonCodeDisclosures: Object.fromEntries(activeReasons.map((c) => [c, disclosures[c] ?? 'Policy signal active.'])),
+      reasonCodeDisclosures: Object.fromEntries(
+        activeReasons.map((c) => [c, REASON_CODE_DISCLOSURES[c] ?? 'Policy signal active.']),
+      ),
     };
   });
 
@@ -191,7 +290,8 @@ export async function registerPayoutAdvancePricingRoutes(app: FastifyInstance): 
     const { developerId } = (req as AuthedRequest).auth;
     const r = await pool.query(
       `select id, amount_cents, fee_cents, net_cents, status, limit_decision_id, ingestion_run_id,
-              fee_rate_bps, implied_hold_days, effective_apr_proxy_bps, created_at, funded_at, repaid_at
+              fee_rate_bps, implied_hold_days, effective_apr_proxy_bps, principal_repaid_cents, fee_repaid_cents,
+              created_at, funded_at, repaid_at
        from advances where developer_id = $1 order by created_at desc limit 50`,
       [developerId],
     );
@@ -207,6 +307,8 @@ export async function registerPayoutAdvancePricingRoutes(app: FastifyInstance): 
         feeRateBps: row.fee_rate_bps,
         impliedHoldDays: row.implied_hold_days,
         effectiveAprProxyBps: row.effective_apr_proxy_bps != null ? Number(row.effective_apr_proxy_bps) : null,
+        principalRepaidCents: Number(row.principal_repaid_cents ?? 0),
+        feeRepaidCents: Number(row.fee_repaid_cents ?? 0),
         createdAt: row.created_at,
         fundedAt: row.funded_at,
         repaidAt: row.repaid_at,
@@ -229,8 +331,15 @@ export async function registerPayoutAdvancePricingRoutes(app: FastifyInstance): 
   app.post('/v1/advances', { preHandler: authMiddleware }, async (req, reply) => {
     const { developerId } = (req as AuthedRequest).auth;
     const body = (req.body ?? {}) as { amountCents?: number; limitDecisionId?: string };
+    const idempotencyKey = getIdempotencyKey(req);
+    if (!idempotencyKey) return reply.code(400).send({ error: 'idempotency_key_required' });
+    const reqHash = requestHash(body, { endpoint: '/v1/advances' });
+    const idem = await beginIdempotent(developerId, '/v1/advances', idempotencyKey, reqHash);
+    if (idem.replay) return reply.code(idem.code ?? 200).send(idem.body);
+
     const amountCents = Number(body.amountCents);
     if (!Number.isFinite(amountCents) || amountCents <= 0) {
+      await finishIdempotent(developerId, '/v1/advances', idempotencyKey, 400, { error: 'amountCents_required' });
       return reply.code(400).send({ error: 'amountCents_required' });
     }
 
@@ -245,7 +354,11 @@ export async function registerPayoutAdvancePricingRoutes(app: FastifyInstance): 
            where developer_id = $1 order by computed_at desc limit 1`,
           [developerId],
         );
-    if (lim.rowCount !== 1) return reply.code(400).send({ error: 'no_limit_decision' });
+    if (lim.rowCount !== 1) {
+      const outBody = { error: 'no_limit_decision' };
+      await finishIdempotent(developerId, '/v1/advances', idempotencyKey, 400, outBody);
+      return reply.code(400).send(outBody);
+    }
     const maxCents = Number(lim.rows[0]!.max_advance_cents);
 
     const out = await pool.query<{ s: string }>(
@@ -255,12 +368,12 @@ export async function registerPayoutAdvancePricingRoutes(app: FastifyInstance): 
     );
     const outstanding = Number(out.rows[0]!.s);
     if (amountCents + outstanding > maxCents) {
-      return reply.code(400).send({ error: 'exceeds_available', maxAdvanceCents: maxCents, outstandingCents: outstanding });
+      const outBody = { error: 'exceeds_available', maxAdvanceCents: maxCents, outstandingCents: outstanding };
+      await finishIdempotent(developerId, '/v1/advances', idempotencyKey, 400, outBody);
+      return reply.code(400).send(outBody);
     }
 
-    const feeCents = Math.round((amountCents * FEE_RATE_BPS) / 10_000);
-    const netCents = amountCents - feeCents;
-    const aprBps = aprProxyBps(feeCents, amountCents, IMPLIED_HOLD_DAYS_DEFAULT);
+    const quote = computeAdvanceQuote(amountCents);
     const limitId = lim.rows[0]!.id as string;
     const ingestionRunId = lim.rows[0]!.ingestion_run_id as string | null;
 
@@ -276,13 +389,13 @@ export async function registerPayoutAdvancePricingRoutes(app: FastifyInstance): 
         [
           developerId,
           amountCents,
-          feeCents,
-          netCents,
+          quote.feeCents,
+          quote.netCents,
           limitId,
           ingestionRunId,
-          FEE_RATE_BPS,
+          ADVANCE_FEE_RATE_BPS,
           IMPLIED_HOLD_DAYS_DEFAULT,
-          aprBps,
+          quote.effectiveAprProxyBps,
         ],
       );
       const advanceId = ins.rows[0]!.id;
@@ -293,18 +406,28 @@ export async function registerPayoutAdvancePricingRoutes(app: FastifyInstance): 
           advanceId,
           JSON.stringify({
             amountCents,
-            feeCents,
-            netCents,
+            feeCents: quote.feeCents,
+            netCents: quote.netCents,
             limitDecisionId: limitId,
             ingestionRunId,
-            effectiveAprProxyBps: aprBps,
+            effectiveAprProxyBps: quote.effectiveAprProxyBps,
           }),
         ],
       );
       await client.query('COMMIT');
-      return reply.code(201).send({ id: advanceId, status: 'requested', amountCents, feeCents, netCents, effectiveAprProxyBps: aprBps });
+      const outBody = {
+        id: advanceId,
+        status: 'requested',
+        amountCents,
+        feeCents: quote.feeCents,
+        netCents: quote.netCents,
+        effectiveAprProxyBps: quote.effectiveAprProxyBps,
+      };
+      await finishIdempotent(developerId, '/v1/advances', idempotencyKey, 201, outBody);
+      return reply.code(201).send(outBody);
     } catch (e) {
       await client.query('ROLLBACK');
+      await failIdempotent(developerId, '/v1/advances', idempotencyKey, e);
       throw e;
     } finally {
       client.release();
@@ -315,37 +438,114 @@ export async function registerPayoutAdvancePricingRoutes(app: FastifyInstance): 
     const { developerId } = (req as AuthedRequest).auth;
     const { id } = req.params as { id: string };
     const body = (req.body ?? {}) as { to?: string };
-    if (body.to !== 'funded' && body.to !== 'repaid' && body.to !== 'cancelled') {
-      return reply.code(400).send({ error: 'to_must_be_funded_repaid_or_cancelled' });
-    }
+    const idempotencyKey = getIdempotencyKey(req);
+    if (!idempotencyKey) return reply.code(400).send({ error: 'idempotency_key_required' });
+    const reqHash = requestHash(body, { endpoint: '/v1/advances/:id/transition', id });
+    const idem = await beginIdempotent(developerId, '/v1/advances/:id/transition', idempotencyKey, reqHash);
+    if (idem.replay) return reply.code(idem.code ?? 200).send(idem.body);
 
-    const adv = await pool.query<{ status: string }>(
-      `select status from advances where id = $1 and developer_id = $2`,
-      [id, developerId],
-    );
-    if (adv.rowCount !== 1) return reply.code(404).send({ error: 'not_found' });
-    const st = adv.rows[0]!.status;
+    if (body.to !== 'funded' && body.to !== 'repaid' && body.to !== 'cancelled') {
+      const outBody = { error: 'to_must_be_funded_repaid_or_cancelled' };
+      await finishIdempotent(developerId, '/v1/advances/:id/transition', idempotencyKey, 400, outBody);
+      return reply.code(400).send(outBody);
+    }
 
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
+      const adv = await client.query<{
+        status: string;
+        amount_cents: string;
+        fee_cents: string;
+        principal_repaid_cents: string;
+        fee_repaid_cents: string;
+        verification_state: string | null;
+      }>(
+        `select a.status, a.amount_cents, a.fee_cents, a.principal_repaid_cents, a.fee_repaid_cents, p.verification_state
+         from advances a
+         left join payout_accounts p on p.developer_id = a.developer_id
+         where a.id = $1 and a.developer_id = $2
+         for update`,
+        [id, developerId],
+      );
+      if (adv.rowCount !== 1) {
+        await client.query('ROLLBACK');
+        const outBody = { error: 'not_found' };
+        await finishIdempotent(developerId, '/v1/advances/:id/transition', idempotencyKey, 404, outBody);
+        return reply.code(404).send(outBody);
+      }
+      const row = adv.rows[0]!;
+      const st = row.status;
+      const amountCents = Number(row.amount_cents);
+      const feeCents = Number(row.fee_cents);
+      const principalRepaidCents = Number(row.principal_repaid_cents);
+      const feeRepaidCents = Number(row.fee_repaid_cents);
+
       if (body.to === 'funded') {
         if (st !== 'requested') {
           await client.query('ROLLBACK');
-          return reply.code(409).send({ error: 'invalid_transition', from: st, to: 'funded' });
+          const outBody = { error: 'invalid_transition', from: st, to: 'funded' };
+          await finishIdempotent(developerId, '/v1/advances/:id/transition', idempotencyKey, 409, outBody);
+          return reply.code(409).send(outBody);
         }
+        if (row.verification_state !== 'verified') {
+          await client.query('ROLLBACK');
+          const outBody = { error: 'payout_not_verified', verificationState: row.verification_state ?? 'incomplete' };
+          await finishIdempotent(developerId, '/v1/advances/:id/transition', idempotencyKey, 409, outBody);
+          return reply.code(409).send(outBody);
+        }
+        const disb = await postStubDisbursement(client, id, developerId, amountCents - feeCents);
+        if (!disb.ok) {
+          await client.query(
+            `insert into payout_disbursements
+              (advance_id, developer_id, provider, status, amount_cents, failure_code, failure_message)
+             values ($1,$2,'internal_stub','failed',$3,$4,$5)
+             on conflict (advance_id) do update set
+               status = excluded.status,
+               failure_code = excluded.failure_code,
+               failure_message = excluded.failure_message`,
+            [id, developerId, amountCents - feeCents, disb.failureCode, disb.failureMessage],
+          );
+          await client.query(
+            `insert into advance_ledger_events (advance_id, event_type, metadata)
+             values ($1,'advance_disbursement_failed',$2::jsonb)`,
+            [id, JSON.stringify({ failureCode: disb.failureCode, failureMessage: disb.failureMessage })],
+          );
+          await client.query('ROLLBACK');
+          const outBody = { error: 'disbursement_failed', reason: disb.failureCode };
+          await finishIdempotent(developerId, '/v1/advances/:id/transition', idempotencyKey, 502, outBody);
+          return reply.code(502).send(outBody);
+        }
+        await client.query(`update advances set status = 'funded', funded_at = now() where id = $1 and developer_id = $2`, [
+          id,
+          developerId,
+        ]);
         await client.query(
-          `update advances set status = 'funded', funded_at = now() where id = $1 and developer_id = $2`,
-          [id, developerId],
+          `insert into advance_ledger_events (advance_id, event_type, metadata)
+           values ($1,'advance_disbursement_posted',$2::jsonb)`,
+          [id, JSON.stringify({ externalTransferId: disb.externalTransferId, netCents: amountCents - feeCents })],
         );
         await client.query(
-          `insert into advance_ledger_events (advance_id, event_type, metadata) values ($1,'advance_funded', '{}'::jsonb)`,
-          [id],
+          `insert into advance_ledger_events (advance_id, event_type, metadata)
+           values ($1,'advance_funded',$2::jsonb)`,
+          [id, JSON.stringify({ amountCents, feeCents, netCents: amountCents - feeCents })],
         );
       } else if (body.to === 'repaid') {
         if (st !== 'funded') {
           await client.query('ROLLBACK');
-          return reply.code(409).send({ error: 'invalid_transition', from: st, to: 'repaid' });
+          const outBody = { error: 'invalid_transition', from: st, to: 'repaid' };
+          await finishIdempotent(developerId, '/v1/advances/:id/transition', idempotencyKey, 409, outBody);
+          return reply.code(409).send(outBody);
+        }
+        if (principalRepaidCents < amountCents || feeRepaidCents < feeCents) {
+          await client.query('ROLLBACK');
+          const outBody = {
+            error: 'cannot_mark_repaid_before_settlement',
+            principalRemainingCents: Math.max(0, amountCents - principalRepaidCents),
+            feeRemainingCents: Math.max(0, feeCents - feeRepaidCents),
+          };
+          await finishIdempotent(developerId, '/v1/advances/:id/transition', idempotencyKey, 409, outBody);
+          return reply.code(409).send(outBody);
         }
         await client.query(
           `update advances set status = 'repaid', repaid_at = now() where id = $1 and developer_id = $2`,
@@ -358,7 +558,9 @@ export async function registerPayoutAdvancePricingRoutes(app: FastifyInstance): 
       } else if (body.to === 'cancelled') {
         if (st !== 'requested') {
           await client.query('ROLLBACK');
-          return reply.code(409).send({ error: 'invalid_transition', from: st, to: 'cancelled' });
+          const outBody = { error: 'invalid_transition', from: st, to: 'cancelled' };
+          await finishIdempotent(developerId, '/v1/advances/:id/transition', idempotencyKey, 409, outBody);
+          return reply.code(409).send(outBody);
         }
         await client.query(
           `update advances set status = 'cancelled' where id = $1 and developer_id = $2`,
@@ -370,12 +572,252 @@ export async function registerPayoutAdvancePricingRoutes(app: FastifyInstance): 
         );
       }
       await client.query('COMMIT');
-      return { ok: true, id, status: body.to === 'funded' ? 'funded' : body.to === 'repaid' ? 'repaid' : 'cancelled' };
+      const outBody = {
+        ok: true,
+        id,
+        status: body.to === 'funded' ? 'funded' : body.to === 'repaid' ? 'repaid' : 'cancelled',
+      };
+      await finishIdempotent(developerId, '/v1/advances/:id/transition', idempotencyKey, 200, outBody);
+      return outBody;
     } catch (e) {
       await client.query('ROLLBACK');
+      await failIdempotent(developerId, '/v1/advances/:id/transition', idempotencyKey, e);
       throw e;
     } finally {
       client.release();
     }
+  });
+
+  app.post('/v1/settlements/reconcile', { preHandler: authMiddleware }, async (req, reply) => {
+    const { developerId } = (req as AuthedRequest).auth;
+    const body = (req.body ?? {}) as {
+      events?: Array<{
+        advanceId?: string;
+        amountCents?: number;
+        providerEventId?: string;
+        occurredAt?: string;
+        rawPayload?: Record<string, unknown>;
+      }>;
+    };
+    const idempotencyKey = getIdempotencyKey(req);
+    if (!idempotencyKey) return reply.code(400).send({ error: 'idempotency_key_required' });
+    const reqHash = requestHash(body, { endpoint: '/v1/settlements/reconcile' });
+    const idem = await beginIdempotent(developerId, '/v1/settlements/reconcile', idempotencyKey, reqHash);
+    if (idem.replay) return reply.code(idem.code ?? 200).send(idem.body);
+
+    if (!Array.isArray(body.events) || body.events.length === 0) {
+      const outBody = { error: 'events_required' };
+      await finishIdempotent(developerId, '/v1/settlements/reconcile', idempotencyKey, 400, outBody);
+      return reply.code(400).send(outBody);
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const results: Array<Record<string, unknown>> = [];
+      for (const ev of body.events) {
+        const advanceId = ev.advanceId ?? '';
+        const amountCents = Number(ev.amountCents);
+        if (!advanceId || !Number.isFinite(amountCents) || amountCents <= 0) {
+          results.push({ advanceId, status: 'invalid_event' });
+          continue;
+        }
+        const adv = await client.query<{
+          status: string;
+          amount_cents: string;
+          fee_cents: string;
+          principal_repaid_cents: string;
+          fee_repaid_cents: string;
+        }>(
+          `select status, amount_cents, fee_cents, principal_repaid_cents, fee_repaid_cents
+           from advances
+           where id = $1 and developer_id = $2
+           for update`,
+          [advanceId, developerId],
+        );
+        if (adv.rowCount !== 1) {
+          results.push({ advanceId, status: 'not_found' });
+          continue;
+        }
+        const row = adv.rows[0]!;
+        if (row.status !== 'funded' && row.status !== 'repaid') {
+          results.push({ advanceId, status: 'not_fundable_state', currentStatus: row.status });
+          continue;
+        }
+        const principalRemaining = Math.max(0, Number(row.amount_cents) - Number(row.principal_repaid_cents));
+        const feeRemaining = Math.max(0, Number(row.fee_cents) - Number(row.fee_repaid_cents));
+        const principalAppliedCents = Math.min(amountCents, principalRemaining);
+        const feeAppliedCents = Math.min(amountCents - principalAppliedCents, feeRemaining);
+        const applied = principalAppliedCents + feeAppliedCents;
+
+        let duplicate = false;
+        if (ev.providerEventId) {
+          const settled = await client.query(
+            `insert into settlement_events (
+               developer_id, advance_id, provider, provider_event_id, amount_cents,
+               principal_applied_cents, fee_applied_cents, event_occurred_at, raw_payload
+             )
+             values ($1,$2,'apple_settlement',$3,$4,$5,$6,$7,$8::jsonb)
+             on conflict (provider, provider_event_id) do nothing`,
+            [
+              developerId,
+              advanceId,
+              ev.providerEventId,
+              amountCents,
+              principalAppliedCents,
+              feeAppliedCents,
+              ev.occurredAt ?? new Date().toISOString(),
+              JSON.stringify(ev.rawPayload ?? {}),
+            ],
+          );
+          duplicate = settled.rowCount === 0;
+        } else {
+          await client.query(
+            `insert into settlement_events (
+               developer_id, advance_id, provider, amount_cents, principal_applied_cents, fee_applied_cents, event_occurred_at, raw_payload
+             )
+             values ($1,$2,'apple_settlement',$3,$4,$5,$6,$7::jsonb)`,
+            [
+              developerId,
+              advanceId,
+              amountCents,
+              principalAppliedCents,
+              feeAppliedCents,
+              ev.occurredAt ?? new Date().toISOString(),
+              JSON.stringify(ev.rawPayload ?? {}),
+            ],
+          );
+        }
+        if (duplicate) {
+          results.push({ advanceId, status: 'duplicate_provider_event' });
+          continue;
+        }
+        if (applied > 0) {
+          await client.query(
+            `update advances
+             set principal_repaid_cents = principal_repaid_cents + $3,
+                 fee_repaid_cents = fee_repaid_cents + $4
+             where id = $1 and developer_id = $2`,
+            [advanceId, developerId, principalAppliedCents, feeAppliedCents],
+          );
+          await client.query(
+            `insert into advance_ledger_events (advance_id, event_type, metadata)
+             values ($1,'advance_settlement_applied',$2::jsonb)`,
+            [
+              advanceId,
+              JSON.stringify({
+                amountCents,
+                principalAppliedCents,
+                feeAppliedCents,
+                providerEventId: ev.providerEventId ?? null,
+              }),
+            ],
+          );
+        }
+
+        const latest = await client.query<{ status: string }>(
+          `select status from advances
+           where id = $1 and developer_id = $2 and principal_repaid_cents >= amount_cents and fee_repaid_cents >= fee_cents`,
+          [advanceId, developerId],
+        );
+        if (latest.rowCount === 1 && latest.rows[0]!.status === 'funded') {
+          await client.query(`update advances set status = 'repaid', repaid_at = now() where id = $1 and developer_id = $2`, [
+            advanceId,
+            developerId,
+          ]);
+          await client.query(
+            `insert into advance_ledger_events (advance_id, event_type, metadata)
+             values ($1,'advance_repaid', $2::jsonb)`,
+            [advanceId, JSON.stringify({ via: 'settlement_reconciliation' })],
+          );
+          results.push({ advanceId, status: 'applied_and_closed', principalAppliedCents, feeAppliedCents });
+        } else {
+          results.push({ advanceId, status: 'applied', principalAppliedCents, feeAppliedCents });
+        }
+      }
+      await client.query('COMMIT');
+      const outBody = { ok: true, results };
+      await finishIdempotent(developerId, '/v1/settlements/reconcile', idempotencyKey, 200, outBody);
+      return outBody;
+    } catch (e) {
+      await client.query('ROLLBACK');
+      await failIdempotent(developerId, '/v1/settlements/reconcile', idempotencyKey, e);
+      throw e;
+    } finally {
+      client.release();
+    }
+  });
+
+  app.get('/v1/advances/reporting/outstanding', { preHandler: authMiddleware }, async (req, reply) => {
+    const { developerId } = (req as AuthedRequest).auth;
+    const q = req.query as { days?: string };
+    const days = Math.max(1, Math.min(365, Number(q.days ?? 90)));
+    const now = new Date();
+    const start = new Date(now);
+    start.setUTCDate(start.getUTCDate() - (days - 1));
+    const startIso = dayIso(start);
+    const baselineEvents = await pool.query<{ event_type: string; metadata: Record<string, unknown> }>(
+      `select ale.event_type, ale.metadata
+       from advance_ledger_events ale
+       join advances a on a.id = ale.advance_id
+       where a.developer_id = $1
+         and ale.created_at < $2::timestamptz
+         and ale.event_type in ('advance_funded', 'advance_settlement_applied')
+       order by ale.created_at asc`,
+      [developerId, `${startIso}T00:00:00.000Z`],
+    );
+    const events = await pool.query<{ created_at: string; event_type: string; metadata: Record<string, unknown> }>(
+      `select ale.created_at::text, ale.event_type, ale.metadata
+       from advance_ledger_events ale
+       join advances a on a.id = ale.advance_id
+       where a.developer_id = $1
+         and ale.created_at >= $2::timestamptz
+       order by ale.created_at asc`,
+      [developerId, `${startIso}T00:00:00.000Z`],
+    );
+    const buckets = new Map<string, { principalDelta: number; feeDelta: number }>();
+    let principal = 0;
+    let fee = 0;
+    for (const e of baselineEvents.rows) {
+      if (e.event_type === 'advance_funded') {
+        principal += Number(e.metadata?.amountCents ?? 0);
+        fee += Number(e.metadata?.feeCents ?? 0);
+      } else if (e.event_type === 'advance_settlement_applied') {
+        principal = Math.max(0, principal - Number(e.metadata?.principalAppliedCents ?? 0));
+        fee = Math.max(0, fee - Number(e.metadata?.feeAppliedCents ?? 0));
+      }
+    }
+    for (const e of events.rows) {
+      const key = dayIso(new Date(e.created_at));
+      const cur = buckets.get(key) ?? { principalDelta: 0, feeDelta: 0 };
+      if (e.event_type === 'advance_funded') {
+        cur.principalDelta += Number(e.metadata?.amountCents ?? 0);
+        cur.feeDelta += Number(e.metadata?.feeCents ?? 0);
+      } else if (e.event_type === 'advance_settlement_applied') {
+        cur.principalDelta -= Number(e.metadata?.principalAppliedCents ?? 0);
+        cur.feeDelta -= Number(e.metadata?.feeAppliedCents ?? 0);
+      } else if (e.event_type === 'advance_repaid') {
+        // no-op: repayment deltas are already represented by settlement-applied events
+      }
+      buckets.set(key, cur);
+    }
+    const series: Array<{ date: string; principalOutstandingCents: number; feeOutstandingCents: number; totalOutstandingCents: number }> = [];
+    for (let i = 0; i < days; i += 1) {
+      const d = new Date(start);
+      d.setUTCDate(start.getUTCDate() + i);
+      const key = dayIso(d);
+      const delta = buckets.get(key);
+      if (delta) {
+        principal = Math.max(0, principal + delta.principalDelta);
+        fee = Math.max(0, fee + delta.feeDelta);
+      }
+      series.push({
+        date: key,
+        principalOutstandingCents: principal,
+        feeOutstandingCents: fee,
+        totalOutstandingCents: principal + fee,
+      });
+    }
+    return { days, series };
   });
 }

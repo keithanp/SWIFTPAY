@@ -1,4 +1,11 @@
-import type { AdvanceRow, DashboardSummary, PayoutProfile, PricingTransparency } from '../pipelineTypes';
+import type {
+  AdvanceRow,
+  DashboardSummary,
+  OutstandingSeriesPoint,
+  PayoutProfile,
+  PricingTransparency,
+  SettlementReconcileResult,
+} from '../pipelineTypes';
 
 const STORAGE_KEY = 'swiftpay_pipeline_jwt';
 
@@ -37,6 +44,13 @@ async function apiFetch(path: string, init: RequestInit & { json?: unknown } = {
     body = JSON.stringify(init.json);
   }
   return fetch(url, { ...init, headers, body });
+}
+
+function idempotencyHeader(): Record<string, string> {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return { 'Idempotency-Key': crypto.randomUUID() };
+  }
+  return { 'Idempotency-Key': `${Date.now()}-${Math.random().toString(16).slice(2)}` };
 }
 
 export async function fetchDashboardSummary(): Promise<DashboardSummary> {
@@ -110,7 +124,7 @@ export async function postAdvance(body: { amountCents: number; limitDecisionId?:
   netCents: number;
   effectiveAprProxyBps: number;
 }> {
-  const res = await apiFetch('/v1/advances', { method: 'POST', json: body });
+  const res = await apiFetch('/v1/advances', { method: 'POST', headers: idempotencyHeader(), json: body });
   if (!res.ok) {
     const err = (await res.json().catch(() => ({}))) as { message?: string; error?: string };
     throw new Error(err.message ?? err.error ?? `HTTP ${res.status}`);
@@ -126,11 +140,45 @@ export async function postAdvance(body: { amountCents: number; limitDecisionId?:
 }
 
 export async function postAdvanceTransition(id: string, to: 'funded' | 'repaid' | 'cancelled'): Promise<{ ok: boolean }> {
-  const res = await apiFetch(`/v1/advances/${id}/transition`, { method: 'POST', json: { to } });
+  const res = await apiFetch(`/v1/advances/${id}/transition`, {
+    method: 'POST',
+    headers: idempotencyHeader(),
+    json: { to },
+  });
   if (!res.ok) {
     const err = (await res.json().catch(() => ({}))) as { message?: string; error?: string };
     throw new Error(err.message ?? err.error ?? `HTTP ${res.status}`);
   }
   return (await res.json()) as { ok: boolean };
+}
+
+export async function postSettlementReconcile(body: {
+  events: Array<{
+    advanceId: string;
+    amountCents: number;
+    providerEventId?: string;
+    occurredAt?: string;
+    rawPayload?: Record<string, unknown>;
+  }>;
+}): Promise<{ ok: boolean; results: SettlementReconcileResult[] }> {
+  const res = await apiFetch('/v1/settlements/reconcile', {
+    method: 'POST',
+    headers: idempotencyHeader(),
+    json: body,
+  });
+  if (!res.ok) {
+    const err = (await res.json().catch(() => ({}))) as { message?: string; error?: string };
+    throw new Error(err.message ?? err.error ?? `HTTP ${res.status}`);
+  }
+  return (await res.json()) as { ok: boolean; results: SettlementReconcileResult[] };
+}
+
+export async function fetchOutstandingSeries(days = 90): Promise<{ days: number; series: OutstandingSeriesPoint[] }> {
+  const res = await apiFetch(`/v1/advances/reporting/outstanding?days=${days}`, { method: 'GET' });
+  if (!res.ok) {
+    const err = (await res.json().catch(() => ({}))) as { message?: string; error?: string };
+    throw new Error(err.message ?? err.error ?? `HTTP ${res.status}`);
+  }
+  return (await res.json()) as { days: number; series: OutstandingSeriesPoint[] };
 }
 

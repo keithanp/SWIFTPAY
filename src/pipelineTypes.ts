@@ -77,7 +77,23 @@ export type AdvanceRow = {
   feeRateBps: number;
   impliedHoldDays: number;
   effectiveAprProxyBps: number | null;
+  principalRepaidCents?: number;
+  feeRepaidCents?: number;
   createdAt: string;
   fundedAt: string | null;
   repaidAt: string | null;
+};
+
+export type SettlementReconcileResult = {
+  advanceId: string;
+  status: string;
+  principalAppliedCents?: number;
+  feeAppliedCents?: number;
+};
+
+export type OutstandingSeriesPoint = {
+  date: string;
+  principalOutstandingCents: number;
+  feeOutstandingCents: number;
+  totalOutstandingCents: number;
 };
