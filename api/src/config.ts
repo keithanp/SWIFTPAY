@@ -17,4 +17,20 @@ export const config = {
   stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET ?? '',
   payoutRetryMax: Number(process.env.PAYOUT_RETRY_MAX ?? 3),
   payoutRetryBaseMs: Number(process.env.PAYOUT_RETRY_BASE_MS ?? 250),
+  appBaseUrl: process.env.APP_BASE_URL ?? 'http://localhost:5173',
 };
+
+export function assertSecureConfig(): void {
+  if ((process.env.NODE_ENV ?? 'development') !== 'production') return;
+  const insecure = [
+    config.jwtSecret === 'dev-insecure-change-me' ? 'JWT_SECRET' : null,
+    config.encryptionKey === 'dev-insecure-change-me-32bytes!!' ? 'ENCRYPTION_KEY' : null,
+    config.payoutWebhookSecret === 'dev-webhook-secret' ? 'PAYOUT_WEBHOOK_SECRET' : null,
+  ].filter(Boolean);
+  if (insecure.length > 0) {
+    throw new Error(`Insecure production configuration: ${insecure.join(', ')}`);
+  }
+  if (config.payoutProvider === 'stripe' && (!config.stripeSecretKey || !config.stripeWebhookSecret)) {
+    throw new Error('Stripe provider enabled but STRIPE_SECRET_KEY/STRIPE_WEBHOOK_SECRET missing');
+  }
+}

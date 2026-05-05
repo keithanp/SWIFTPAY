@@ -110,6 +110,15 @@ export async function postPayoutVerifyStub(): Promise<{ ok: boolean }> {
   return (await res.json()) as { ok: boolean };
 }
 
+export async function postStripeOnboardingLink(): Promise<{ ok: boolean; accountId: string; onboardingUrl: string }> {
+  const res = await apiFetch('/v1/payout-profile/stripe/onboarding-link', { method: 'POST', json: {} });
+  if (!res.ok) {
+    const err = (await res.json().catch(() => ({}))) as { message?: string; error?: string };
+    throw new Error(err.message ?? err.error ?? `HTTP ${res.status}`);
+  }
+  return (await res.json()) as { ok: boolean; accountId: string; onboardingUrl: string };
+}
+
 export async function fetchPricingTransparency(): Promise<PricingTransparency> {
   const res = await apiFetch('/v1/pricing-transparency', { method: 'GET' });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);

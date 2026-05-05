@@ -8,6 +8,7 @@
    - `verificationState=verified`
    - `provider=stripe`
    - `providerAccountId` set to a valid connected account (`acct_...`).
+   - If missing, generate one with `POST /v1/payout-profile/stripe/onboarding-link`.
 4. Confirm Stripe platform balance and API key scope.
 5. Retry by re-requesting transition `requested -> funded` with a new idempotency key.
 

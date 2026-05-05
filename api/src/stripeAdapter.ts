@@ -74,3 +74,35 @@ export function constructStripeEvent(params: {
 }): Stripe.Event {
   return params.stripe.webhooks.constructEvent(params.rawBody, params.signature, params.webhookSecret);
 }
+
+export async function ensureStripeConnectedAccount(params: {
+  stripe: Stripe;
+  existingAccountId: string | null;
+  developerId: string;
+}): Promise<string> {
+  if (params.existingAccountId) return params.existingAccountId;
+  const acct = await params.stripe.accounts.create({
+    type: 'express',
+    metadata: { developerId: params.developerId },
+    capabilities: {
+      card_payments: { requested: true },
+      transfers: { requested: true },
+    },
+  });
+  return acct.id;
+}
+
+export async function createStripeOnboardingLink(params: {
+  stripe: Stripe;
+  accountId: string;
+  refreshUrl: string;
+  returnUrl: string;
+}): Promise<string> {
+  const link = await params.stripe.accountLinks.create({
+    account: params.accountId,
+    refresh_url: params.refreshUrl,
+    return_url: params.returnUrl,
+    type: 'account_onboarding',
+  });
+  return link.url;
+}

@@ -14,7 +14,13 @@ import { pool } from './db.js';
 import { authMiddleware } from './auth.js';
 import { config } from './config.js';
 import { settlementQueue } from './queue.js';
-import { constructStripeEvent, createStripeClient, dispatchStripeTransfer } from './stripeAdapter.js';
+import {
+  constructStripeEvent,
+  createStripeClient,
+  createStripeOnboardingLink,
+  dispatchStripeTransfer,
+  ensureStripeConnectedAccount,
+} from './stripeAdapter.js';
 
 type AuthedRequest = FastifyRequest & { auth: { developerId: string } };
 
@@ -301,6 +307,36 @@ export async function registerPayoutAdvancePricingRoutes(app: FastifyInstance): 
       [developerId],
     );
     return { ok: true, verificationState: 'verified' };
+  });
+
+  app.post('/v1/payout-profile/stripe/onboarding-link', { preHandler: authMiddleware }, async (req, reply) => {
+    const { developerId } = (req as AuthedRequest).auth;
+    if (config.payoutProvider !== 'stripe') return reply.code(400).send({ error: 'stripe_not_enabled' });
+    if (!stripeClient) return reply.code(500).send({ error: 'stripe_not_configured' });
+
+    const row = await ensurePayoutRow(developerId);
+    const accountId = await ensureStripeConnectedAccount({
+      stripe: stripeClient,
+      existingAccountId: (row.provider_account_id as string | null) ?? null,
+      developerId,
+    });
+    await pool.query(
+      `update payout_accounts
+       set provider = 'stripe',
+           provider_account_id = $2,
+           provider_verification_status = coalesce(provider_verification_status, 'onboarding_started'),
+           verification_state = case when verification_state = 'verified' then verification_state else 'pending_review' end,
+           updated_at = now()
+       where developer_id = $1`,
+      [developerId, accountId],
+    );
+    const onboardingUrl = await createStripeOnboardingLink({
+      stripe: stripeClient,
+      accountId,
+      refreshUrl: `${config.appBaseUrl}/dashboard?stripeRefresh=1`,
+      returnUrl: `${config.appBaseUrl}/dashboard?stripeReturn=1`,
+    });
+    return { ok: true, accountId, onboardingUrl };
   });
 
   app.post('/v1/webhooks/payout-provider', { config: { rawBody: true, rateLimit: { max: 60, timeWindow: '1 minute' } } }, async (req, reply) => {

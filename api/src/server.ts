@@ -4,7 +4,7 @@ import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import rateLimit from '@fastify/rate-limit';
 import rawBody from 'fastify-raw-body';
-import { config } from './config.js';
+import { assertSecureConfig, config } from './config.js';
 import { pool } from './db.js';
 import { registerRoutes } from './routes.js';
 import { closeQueue } from './queue.js';
@@ -18,6 +18,8 @@ const app = Fastify({
         : { target: 'pino-pretty', options: { translateTime: 'SYS:standard', colorize: true } },
   },
 });
+
+assertSecureConfig();
 
 await app.register(cors, { origin: true });
 await app.register(rateLimit, { max: 120, timeWindow: '1 minute' });

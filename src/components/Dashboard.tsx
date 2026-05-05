@@ -31,6 +31,7 @@ import {
   postAdvance,
   postAdvanceTransition,
   postPayoutVerifyStub,
+  postStripeOnboardingLink,
   postSettlementIngest,
   postVerificationRefresh,
   putKycChecklist,
@@ -684,6 +685,28 @@ export function Dashboard({ onLogout, onHome }: DashboardProps) {
                     className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-800 hover:bg-slate-50 disabled:opacity-50"
                   >
                     Stub: mark verified
+                  </button>
+                  <button
+                    type="button"
+                    disabled={pipelineBusy}
+                    onClick={() =>
+                      void (async () => {
+                        setPipelineBusy(true);
+                        try {
+                          const r = await postStripeOnboardingLink();
+                          window.open(r.onboardingUrl, '_blank', 'noopener,noreferrer');
+                          const p = await fetchPayoutProfile();
+                          setPayoutProfile(p);
+                        } catch (e) {
+                          setPipelineError((e as Error).message);
+                        } finally {
+                          setPipelineBusy(false);
+                        }
+                      })()
+                    }
+                    className="rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-xs font-semibold text-blue-700 hover:bg-blue-100 disabled:opacity-50"
+                  >
+                    Stripe onboarding link
                   </button>
                 </div>
                 <p className="text-xs font-medium text-slate-600">
