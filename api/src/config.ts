@@ -13,4 +13,8 @@ export const config = {
   appleMock: (process.env.APPLE_MOCK ?? 'true').toLowerCase() === 'true',
   payoutProvider: process.env.PAYOUT_PROVIDER ?? 'internal_stub',
   payoutWebhookSecret: process.env.PAYOUT_WEBHOOK_SECRET ?? 'dev-webhook-secret',
+  stripeSecretKey: process.env.STRIPE_SECRET_KEY ?? '',
+  stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET ?? '',
+  payoutRetryMax: Number(process.env.PAYOUT_RETRY_MAX ?? 3),
+  payoutRetryBaseMs: Number(process.env.PAYOUT_RETRY_BASE_MS ?? 250),
 };

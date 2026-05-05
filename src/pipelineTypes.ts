@@ -39,6 +39,7 @@ export type PayoutProfile = {
   currency: string;
   verificationState: string;
   provider?: string;
+  providerAccountId?: string | null;
   providerVerificationStatus?: string | null;
   providerFailureCode?: string | null;
   providerFailureMessage?: string | null;
@@ -110,4 +111,12 @@ export type OutstandingSummary = {
   principalRepaidCents: number;
   fundedCount: number;
   repaidCount: number;
+};
+
+export type OpsMetrics = {
+  pendingSettlements: number;
+  failedSettlements: number;
+  failedDisbursements: number;
+  staleIngestions72h: number;
+  idempotencyCompletions24h: number;
 };

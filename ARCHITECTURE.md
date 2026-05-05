@@ -6,7 +6,7 @@
 |-----------|------|
 | `src/` (Vite React) | Product UI (unchanged contract with mock numbers unless wired to API). |
 | `api/` | Fastify REST API: onboarding, credential vaulting, enqueue ingestion, read status/limits. |
-| `worker/` | BullMQ consumer: download/store raw reports, parse, ledger upserts, policy, limit persistence. |
+| `worker/` | BullMQ consumers: ingestion pipeline + settlement reconciliation jobs. |
 | `packages/core` | AES-GCM credential encryption, gzip TSV parser v1, deterministic mock “Apple” payloads. |
 | `packages/policy` | Pure limit engine + tests (trailing revenue, CV, staleness, reason codes). |
 | Postgres | System of record: tenants, runs, raw object index, ledger, snapshots, decisions. |
@@ -23,6 +23,14 @@
 6. Parser v1 expands rows into `revenue_daily` idempotently (`UNIQUE (developer_id, source_raw_report_id, row_fingerprint)`).
 7. Worker aggregates ledger → `@swiftpay/policy` → inserts `feature_snapshots` + `limit_decisions` with explainability JSON.
 8. On failure: run marked `failed`; **previous** `limit_decisions` remain the latest successful decision for `GET /v1/limits`.
+9. Funding transition dispatches payout through provider adapter (`internal_stub` or `stripe`) and persists disbursement events.
+10. Provider webhooks are recorded in `webhook_events`; settlement events are queued to `swiftpay-settlement` for async reconciliation.
+
+## Payout provider + webhook security
+
+- Stripe webhook signature verification uses `STRIPE_WEBHOOK_SECRET`.
+- Mutating routes enforce idempotency keys and route-level rate limits.
+- Rotate `JWT_SECRET`, `ENCRYPTION_KEY`, `PAYOUT_WEBHOOK_SECRET`, and Stripe secrets before production cutover.
 
 ## Threat model (basics)
 

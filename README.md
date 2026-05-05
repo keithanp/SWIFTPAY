@@ -34,6 +34,24 @@ npm run dev:worker # terminal 2
 npm run dev        # terminal 3 — UI; paste pipeline JWT on the gate screen (see docs/PIPELINE.md)
 ```
 
+### Stripe payout adapter
+
+Swiftpay now supports a Stripe-backed disbursement path (`PAYOUT_PROVIDER=stripe`) with:
+
+- transfer dispatch on advance funding
+- Stripe webhook signature verification (`POST /v1/webhooks/payout-provider`)
+- settlement ingestion + async reconciliation queue (`swiftpay-settlement`)
+
+Required env vars in production:
+
+- `STRIPE_SECRET_KEY`
+- `STRIPE_WEBHOOK_SECRET`
+- `PAYOUT_PROVIDER=stripe`
+
+Operational runbook:
+
+- [docs/ADVANCE_OPS_RUNBOOK.md](./docs/ADVANCE_OPS_RUNBOOK.md)
+
 ## Repository
 
 https://github.com/keithanp/SWIFTPAY

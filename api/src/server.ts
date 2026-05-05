@@ -2,6 +2,8 @@ import path from 'node:path';
 import { mkdir } from 'node:fs/promises';
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
+import rateLimit from '@fastify/rate-limit';
+import rawBody from 'fastify-raw-body';
 import { config } from './config.js';
 import { pool } from './db.js';
 import { registerRoutes } from './routes.js';
@@ -18,6 +20,13 @@ const app = Fastify({
 });
 
 await app.register(cors, { origin: true });
+await app.register(rateLimit, { max: 120, timeWindow: '1 minute' });
+await app.register(rawBody, {
+  field: 'rawBody',
+  global: false,
+  runFirst: true,
+  encoding: 'utf8',
+});
 await registerRoutes(app);
 
 await mkdir(path.join(config.dataDir, 'raw'), { recursive: true });

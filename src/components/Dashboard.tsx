@@ -10,16 +10,28 @@ import {
 } from 'recharts';
 import { ADVANCE_FEE_RATE, INITIAL_TRANSACTIONS, MOCK_PROJECTED_REVENUE, MOCK_REVENUE_HISTORY } from '../constants';
 import { getFinancialInsights } from '../services/geminiService';
-import type { AdvanceRow, DashboardSummary, PayoutProfile, PricingTransparency } from '../pipelineTypes';
+import type {
+  AdvanceRow,
+  DashboardSummary,
+  OpsMetrics,
+  OutstandingSeriesPoint,
+  OutstandingSummary,
+  PayoutProfile,
+  PricingTransparency,
+} from '../pipelineTypes';
 import {
   fetchAdvances,
   fetchDashboardSummary,
+  fetchOpsMetrics,
+  fetchOutstandingSeries,
+  fetchOutstandingSummary,
   fetchPayoutProfile,
   fetchPricingTransparency,
   getPipelineJwt,
   postAdvance,
   postAdvanceTransition,
   postPayoutVerifyStub,
+  postSettlementIngest,
   postVerificationRefresh,
   putKycChecklist,
   putPayoutProfile,
@@ -104,18 +116,28 @@ export function Dashboard({ onLogout, onHome }: DashboardProps) {
   const [advances, setAdvances] = useState<AdvanceRow[]>([]);
   const [payoutDraft, setPayoutDraft] = useState({ bankDisplayName: '', accountLast4: '', routingLast4: '' });
   const [advanceActionId, setAdvanceActionId] = useState<string | null>(null);
+  const [outstandingSeries, setOutstandingSeries] = useState<OutstandingSeriesPoint[]>([]);
+  const [outstandingSummary, setOutstandingSummary] = useState<OutstandingSummary | null>(null);
+  const [opsMetrics, setOpsMetrics] = useState<OpsMetrics | null>(null);
+  const [settlementDraft, setSettlementDraft] = useState({ advanceId: '', amountCents: 0, providerEventId: '' });
 
   const loadPipelineAux = useCallback(async () => {
     if (!getPipelineJwt()?.trim()) return;
     try {
-      const [p, pr, a] = await Promise.all([
+      const [p, pr, a, series, summary, metrics] = await Promise.all([
         fetchPayoutProfile(),
         fetchPricingTransparency(),
         fetchAdvances(),
+        fetchOutstandingSeries(90),
+        fetchOutstandingSummary(),
+        fetchOpsMetrics(),
       ]);
       setPayoutProfile(p);
       setPricing(pr);
       setAdvances(a.advances);
+      setOutstandingSeries(series.series);
+      setOutstandingSummary(summary);
+      setOpsMetrics(metrics);
       setPayoutDraft({
         bankDisplayName: p.bankDisplayName,
         accountLast4: p.accountLast4 ?? '',
@@ -293,6 +315,9 @@ export function Dashboard({ onLogout, onHome }: DashboardProps) {
     setPayoutProfile(null);
     setPricing(null);
     setAdvances([]);
+    setOutstandingSeries([]);
+    setOutstandingSummary(null);
+    setOpsMetrics(null);
     setFinancials({
       pendingAppleRevenue: 24_000,
       availableAdvance: 18_500,
@@ -558,6 +583,34 @@ export function Dashboard({ onLogout, onHome }: DashboardProps) {
                 Where advances land once funded. Values are stored server-side; this is not a live bank link.
               </p>
               <div className="mt-4 space-y-3">
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="text-xs font-medium text-slate-500">Provider</label>
+                    <select
+                      value={payoutProfile?.provider ?? 'internal_stub'}
+                      onChange={(e) =>
+                        setPayoutProfile((prev) => (prev ? { ...prev, provider: e.target.value } : prev))
+                      }
+                      className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm"
+                    >
+                      <option value="internal_stub">internal_stub</option>
+                      <option value="stripe">stripe</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-xs font-medium text-slate-500">Provider account id</label>
+                    <input
+                      value={payoutProfile?.providerAccountId ?? ''}
+                      onChange={(e) =>
+                        setPayoutProfile((prev) =>
+                          prev ? { ...prev, providerAccountId: e.target.value } : prev,
+                        )
+                      }
+                      placeholder="acct_..."
+                      className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm"
+                    />
+                  </div>
+                </div>
                 <div>
                   <label className="text-xs font-medium text-slate-500">Bank display name</label>
                   <input
@@ -596,6 +649,8 @@ export function Dashboard({ onLogout, onHome }: DashboardProps) {
                             bankDisplayName: payoutDraft.bankDisplayName,
                             routingLast4: payoutDraft.routingLast4 || undefined,
                             accountLast4: payoutDraft.accountLast4 || undefined,
+                            provider: payoutProfile?.provider ?? 'internal_stub',
+                            providerAccountId: payoutProfile?.providerAccountId ?? undefined,
                           });
                           setPayoutProfile((prev) => (prev ? { ...prev, ...p } : p));
                         } catch (e) {
@@ -635,6 +690,11 @@ export function Dashboard({ onLogout, onHome }: DashboardProps) {
                   Verification:{' '}
                   <span className="text-blue-700">{payoutProfile?.verificationState ?? '—'}</span>
                 </p>
+                {payoutProfile?.providerFailureCode ? (
+                  <p className="text-xs text-red-600">
+                    Provider failure ({payoutProfile.providerFailureCode}): {payoutProfile.providerFailureMessage ?? 'unknown'}
+                  </p>
+                ) : null}
               </div>
 
               <div className="mt-8 border-t border-slate-100 pt-6">
@@ -838,6 +898,116 @@ export function Dashboard({ onLogout, onHome }: DashboardProps) {
               </table>
             </div>
           </section>
+        ) : null}
+
+        {getPipelineJwt()?.trim() ? (
+          <div className="grid gap-6 lg:grid-cols-2">
+            <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+              <h2 className="text-lg font-semibold text-slate-900">Operations metrics</h2>
+              <p className="mt-1 text-sm text-slate-500">Webhook/reconciliation health and outstanding exposure.</p>
+              <div className="mt-4 grid grid-cols-2 gap-3 text-sm">
+                <div className="rounded-lg border border-slate-100 bg-slate-50 p-3">
+                  <p className="text-slate-500">Pending settlements</p>
+                  <p className="text-xl font-semibold text-slate-900">{opsMetrics?.pendingSettlements ?? 0}</p>
+                </div>
+                <div className="rounded-lg border border-slate-100 bg-slate-50 p-3">
+                  <p className="text-slate-500">Failed settlements</p>
+                  <p className="text-xl font-semibold text-red-700">{opsMetrics?.failedSettlements ?? 0}</p>
+                </div>
+                <div className="rounded-lg border border-slate-100 bg-slate-50 p-3">
+                  <p className="text-slate-500">Failed disbursements</p>
+                  <p className="text-xl font-semibold text-red-700">{opsMetrics?.failedDisbursements ?? 0}</p>
+                </div>
+                <div className="rounded-lg border border-slate-100 bg-slate-50 p-3">
+                  <p className="text-slate-500">Outstanding total</p>
+                  <p className="text-xl font-semibold text-slate-900">
+                    {formatMoney((outstandingSummary?.totalOutstandingCents ?? 0) / 100)}
+                  </p>
+                </div>
+              </div>
+              <div className="mt-4 text-xs text-slate-600">
+                Realized fees: {formatMoney((outstandingSummary?.feeRealizedCents ?? 0) / 100)} · Funded:{' '}
+                {outstandingSummary?.fundedCount ?? 0} · Repaid: {outstandingSummary?.repaidCount ?? 0}
+              </div>
+              <div className="mt-5 h-44">
+                <ResponsiveContainer width="100%" height="100%">
+                  <AreaChart data={outstandingSeries}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" vertical={false} />
+                    <XAxis dataKey="date" tickFormatter={formatShortDate} stroke="#94a3b8" tick={{ fontSize: 11 }} />
+                    <YAxis stroke="#94a3b8" tick={{ fontSize: 11 }} tickFormatter={(v) => `$${Math.round(Number(v) / 1000)}k`} />
+                    <Tooltip formatter={(value: number) => formatMoney(value / 100)} labelFormatter={(l) => formatShortDate(String(l))} />
+                    <Area type="monotone" dataKey="principalOutstandingCents" stroke="#2563eb" fill="#bfdbfe" name="Principal outstanding" />
+                    <Area type="monotone" dataKey="feeOutstandingCents" stroke="#7c3aed" fill="#ddd6fe" name="Fee outstanding" />
+                  </AreaChart>
+                </ResponsiveContainer>
+              </div>
+            </section>
+
+            <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+              <h2 className="text-lg font-semibold text-slate-900">Settlement ingestion (admin)</h2>
+              <p className="mt-1 text-sm text-slate-500">Queue provider settlement events for async worker reconciliation.</p>
+              <div className="mt-4 space-y-3">
+                <div>
+                  <label className="text-xs font-medium text-slate-500">Advance id</label>
+                  <input
+                    value={settlementDraft.advanceId}
+                    onChange={(e) => setSettlementDraft((d) => ({ ...d, advanceId: e.target.value }))}
+                    className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm"
+                    placeholder="advance UUID"
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="text-xs font-medium text-slate-500">Amount (cents)</label>
+                    <input
+                      type="number"
+                      value={settlementDraft.amountCents}
+                      onChange={(e) => setSettlementDraft((d) => ({ ...d, amountCents: Number(e.target.value) || 0 }))}
+                      className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-xs font-medium text-slate-500">Provider event id</label>
+                    <input
+                      value={settlementDraft.providerEventId}
+                      onChange={(e) => setSettlementDraft((d) => ({ ...d, providerEventId: e.target.value }))}
+                      className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm"
+                      placeholder="evt_..."
+                    />
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  disabled={pipelineBusy || !settlementDraft.advanceId || settlementDraft.amountCents <= 0}
+                  onClick={() =>
+                    void (async () => {
+                      setPipelineBusy(true);
+                      try {
+                        await postSettlementIngest({
+                          events: [
+                            {
+                              advanceId: settlementDraft.advanceId,
+                              amountCents: settlementDraft.amountCents,
+                              providerEventId: settlementDraft.providerEventId || undefined,
+                            },
+                          ],
+                        });
+                        await loadPipelineAux();
+                        setSettlementDraft({ advanceId: '', amountCents: 0, providerEventId: '' });
+                      } catch (e) {
+                        setPipelineError((e as Error).message);
+                      } finally {
+                        setPipelineBusy(false);
+                      }
+                    })()
+                  }
+                  className="rounded-lg bg-slate-900 px-3 py-2 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-50"
+                >
+                  Queue settlement event
+                </button>
+              </div>
+            </section>
+          </div>
         ) : null}
 
         <div className="grid gap-6 lg:grid-cols-3">

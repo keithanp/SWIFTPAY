@@ -1,6 +1,7 @@
 import type {
   AdvanceRow,
   DashboardSummary,
+  OpsMetrics,
   OutstandingSeriesPoint,
   OutstandingSummary,
   PayoutProfile,
@@ -84,6 +85,10 @@ export async function putPayoutProfile(body: {
   routingLast4?: string;
   currency?: string;
   verificationState?: string;
+  provider?: string;
+  providerAccountId?: string;
+  providerBankAccountId?: string;
+  providerCustomerId?: string;
 }): Promise<PayoutProfile> {
   const res = await apiFetch('/v1/payout-profile', { method: 'PUT', json: body });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -211,5 +216,14 @@ export async function postSettlementIngest(body: {
     throw new Error(err.message ?? err.error ?? `HTTP ${res.status}`);
   }
   return (await res.json()) as { ok: boolean; results: SettlementReconcileResult[] };
+}
+
+export async function fetchOpsMetrics(): Promise<OpsMetrics> {
+  const res = await apiFetch('/v1/ops/metrics', { method: 'GET' });
+  if (!res.ok) {
+    const err = (await res.json().catch(() => ({}))) as { message?: string; error?: string };
+    throw new Error(err.message ?? err.error ?? `HTTP ${res.status}`);
+  }
+  return (await res.json()) as OpsMetrics;
 }
 
