@@ -8,7 +8,12 @@ export const ingestQueue = new Queue<{ developerId: string; ingestionRunId: stri
   connection,
 });
 
+export const settlementQueue = new Queue<{ settlementEventId: string }>('swiftpay-settlement', {
+  connection,
+});
+
 export async function closeQueue(): Promise<void> {
   await ingestQueue.close();
+  await settlementQueue.close();
   await connection.quit();
 }

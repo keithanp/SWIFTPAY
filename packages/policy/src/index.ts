@@ -12,4 +12,5 @@ export {
   REASON_CODE_DISCLOSURES,
   aprProxyBps,
   computeAdvanceQuote,
+  allocateSettlement,
 } from './advances.js';

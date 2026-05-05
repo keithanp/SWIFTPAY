@@ -8,4 +8,5 @@ export const config = {
   redisUrl: process.env.REDIS_URL ?? 'redis://127.0.0.1:6379',
   dataDir: process.env.DATA_DIR ?? path.resolve(__dirname, '../../data'),
   appleMock: (process.env.APPLE_MOCK ?? 'true').toLowerCase() === 'true',
+  settlementSweepMs: Number(process.env.SETTLEMENT_SWEEP_MS ?? 30000),
 };

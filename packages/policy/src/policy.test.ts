@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import { computePolicy, hashPolicyInputs, POLICY_VERSION } from './policy.js';
+import {
+  ADVANCE_FEE_RATE_BPS,
+  REASON_CODE_DISCLOSURES,
+  allocateSettlement,
+  computeAdvanceQuote,
+} from './advances.js';
 
 const fixedNow = new Date('2025-04-15T12:00:00.000Z');
 
@@ -64,5 +70,30 @@ describe('hashPolicyInputs', () => {
   it('is deterministic', () => {
     expect(hashPolicyInputs({ a: 1 })).toBe(hashPolicyInputs({ a: 1 }));
     expect(hashPolicyInputs({ a: 1 })).not.toBe(hashPolicyInputs({ a: 2 }));
+  });
+});
+
+describe('advance policy helpers', () => {
+  it('computes quote from shared fee constant', () => {
+    const q = computeAdvanceQuote(100_00);
+    expect(q.feeCents).toBe(Math.round((100_00 * ADVANCE_FEE_RATE_BPS) / 10_000));
+    expect(q.netCents).toBe(100_00 - q.feeCents);
+    expect(q.effectiveAprProxyBps).toBeGreaterThan(0);
+  });
+
+  it('allocates settlement principal-first and caps overflow', () => {
+    const x = allocateSettlement({
+      amountCents: 1_000,
+      principalRemainingCents: 700,
+      feeRemainingCents: 200,
+    });
+    expect(x.principalAppliedCents).toBe(700);
+    expect(x.feeAppliedCents).toBe(200);
+    expect(x.unappliedCents).toBe(100);
+  });
+
+  it('contains disclosure copy for known reason codes', () => {
+    expect(REASON_CODE_DISCLOSURES.NO_LEDGER_DATA).toMatch(/No verified Apple ledger/i);
+    expect(REASON_CODE_DISCLOSURES.HIGH_VOLATILITY).toMatch(/haircut/i);
   });
 });

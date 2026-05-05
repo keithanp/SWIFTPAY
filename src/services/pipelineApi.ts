@@ -2,6 +2,7 @@ import type {
   AdvanceRow,
   DashboardSummary,
   OutstandingSeriesPoint,
+  OutstandingSummary,
   PayoutProfile,
   PricingTransparency,
   SettlementReconcileResult,
@@ -180,5 +181,35 @@ export async function fetchOutstandingSeries(days = 90): Promise<{ days: number;
     throw new Error(err.message ?? err.error ?? `HTTP ${res.status}`);
   }
   return (await res.json()) as { days: number; series: OutstandingSeriesPoint[] };
+}
+
+export async function fetchOutstandingSummary(): Promise<OutstandingSummary> {
+  const res = await apiFetch('/v1/advances/reporting/summary', { method: 'GET' });
+  if (!res.ok) {
+    const err = (await res.json().catch(() => ({}))) as { message?: string; error?: string };
+    throw new Error(err.message ?? err.error ?? `HTTP ${res.status}`);
+  }
+  return (await res.json()) as OutstandingSummary;
+}
+
+export async function postSettlementIngest(body: {
+  events: Array<{
+    advanceId: string;
+    amountCents: number;
+    providerEventId?: string;
+    occurredAt?: string;
+    rawPayload?: Record<string, unknown>;
+  }>;
+}): Promise<{ ok: boolean; results: SettlementReconcileResult[] }> {
+  const res = await apiFetch('/v1/settlements/ingest', {
+    method: 'POST',
+    headers: idempotencyHeader(),
+    json: body,
+  });
+  if (!res.ok) {
+    const err = (await res.json().catch(() => ({}))) as { message?: string; error?: string };
+    throw new Error(err.message ?? err.error ?? `HTTP ${res.status}`);
+  }
+  return (await res.json()) as { ok: boolean; results: SettlementReconcileResult[] };
 }
 

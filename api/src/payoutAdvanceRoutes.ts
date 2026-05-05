@@ -1,16 +1,19 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import {
   ADVANCE_FEE_RATE_BPS,
   IMPLIED_HOLD_DAYS_DEFAULT,
   IMPLIED_HOLD_DAYS_MAX,
   REASON_CODE_DISCLOSURES,
+  allocateSettlement,
   aprProxyBps,
   computeAdvanceQuote,
 } from '@swiftpay/policy';
 import type { PoolClient } from 'pg';
 import { pool } from './db.js';
 import { authMiddleware } from './auth.js';
+import { config } from './config.js';
+import { settlementQueue } from './queue.js';
 
 type AuthedRequest = FastifyRequest & { auth: { developerId: string } };
 
@@ -114,22 +117,39 @@ function dayIso(d: Date): string {
   return d.toISOString().slice(0, 10);
 }
 
-async function postStubDisbursement(
+function verifyWebhookSignature(rawBody: string, signatureHex: string | null): boolean {
+  if (!signatureHex) return false;
+  const expected = createHmac('sha256', config.payoutWebhookSecret).update(rawBody).digest('hex');
+  const a = Buffer.from(expected, 'hex');
+  const b = Buffer.from(signatureHex, 'hex');
+  if (a.length !== b.length) return false;
+  return timingSafeEqual(a, b);
+}
+
+async function dispatchDisbursement(
   client: PoolClient,
   advanceId: string,
   developerId: string,
   amountCents: number,
 ): Promise<{ ok: true; externalTransferId: string } | { ok: false; failureCode: string; failureMessage: string }> {
+  if (config.payoutProvider !== 'internal_stub') {
+    return {
+      ok: false,
+      failureCode: 'provider_not_configured',
+      failureMessage: `Provider ${config.payoutProvider} is not wired yet.`,
+    };
+  }
   const transferId = `stub_tr_${randomUUID()}`;
   await client.query(
     `insert into payout_disbursements (advance_id, developer_id, provider, status, amount_cents, external_transfer_id, posted_at)
-     values ($1,$2,'internal_stub','posted',$3,$4,now())
+     values ($1,$2,$5,'posted',$3,$4,now())
      on conflict (advance_id) do update set
        status = excluded.status,
+       provider = excluded.provider,
        amount_cents = excluded.amount_cents,
        external_transfer_id = excluded.external_transfer_id,
        posted_at = excluded.posted_at`,
-    [advanceId, developerId, amountCents, transferId],
+    [advanceId, developerId, amountCents, transferId, config.payoutProvider],
   );
   return { ok: true, externalTransferId: transferId };
 }
@@ -144,6 +164,10 @@ export async function registerPayoutAdvancePricingRoutes(app: FastifyInstance): 
       routingLast4: row.routing_last4,
       currency: row.currency,
       verificationState: row.verification_state,
+      provider: row.provider,
+      providerVerificationStatus: row.provider_verification_status,
+      providerFailureCode: row.provider_failure_code,
+      providerFailureMessage: row.provider_failure_message,
       kycChecklist: row.kyc_checklist,
       updatedAt: row.updated_at,
     };
@@ -158,6 +182,10 @@ export async function registerPayoutAdvancePricingRoutes(app: FastifyInstance): 
       routingLast4?: string;
       currency?: string;
       verificationState?: string;
+      provider?: string;
+      providerAccountId?: string;
+      providerBankAccountId?: string;
+      providerCustomerId?: string;
     };
     const allowed = new Set(['incomplete', 'pending_review', 'verified', 'rejected']);
     if (body.verificationState && !allowed.has(body.verificationState)) {
@@ -170,6 +198,10 @@ export async function registerPayoutAdvancePricingRoutes(app: FastifyInstance): 
          routing_last4 = coalesce($4, routing_last4),
          currency = coalesce($5, currency),
          verification_state = coalesce($6, verification_state),
+         provider = coalesce($7, provider),
+         provider_account_id = coalesce($8, provider_account_id),
+         provider_bank_account_id = coalesce($9, provider_bank_account_id),
+         provider_customer_id = coalesce($10, provider_customer_id),
          updated_at = now()
        where developer_id = $1`,
       [
@@ -179,6 +211,10 @@ export async function registerPayoutAdvancePricingRoutes(app: FastifyInstance): 
         body.routingLast4 ?? null,
         body.currency ?? null,
         body.verificationState ?? null,
+        body.provider ?? null,
+        body.providerAccountId ?? null,
+        body.providerBankAccountId ?? null,
+        body.providerCustomerId ?? null,
       ],
     );
     const row = (await pool.query(`select * from payout_accounts where developer_id = $1`, [developerId])).rows[0]!;
@@ -188,6 +224,10 @@ export async function registerPayoutAdvancePricingRoutes(app: FastifyInstance): 
       routingLast4: row.routing_last4,
       currency: row.currency,
       verificationState: row.verification_state,
+      provider: row.provider,
+      providerVerificationStatus: row.provider_verification_status,
+      providerFailureCode: row.provider_failure_code,
+      providerFailureMessage: row.provider_failure_message,
       kycChecklist: row.kyc_checklist,
     };
   });
@@ -231,10 +271,70 @@ export async function registerPayoutAdvancePricingRoutes(app: FastifyInstance): 
     const { developerId } = (req as AuthedRequest).auth;
     await ensurePayoutRow(developerId);
     await pool.query(
-      `update payout_accounts set verification_state = 'verified', updated_at = now() where developer_id = $1`,
+      `update payout_accounts
+       set verification_state = 'verified',
+           provider_verification_status = 'verified',
+           verified_at = now(),
+           updated_at = now()
+       where developer_id = $1`,
       [developerId],
     );
     return { ok: true, verificationState: 'verified' };
+  });
+
+  app.post('/v1/webhooks/payout-provider', async (req, reply) => {
+    const sig = typeof req.headers['x-payout-signature'] === 'string' ? req.headers['x-payout-signature'] : null;
+    const rawBody = JSON.stringify(req.body ?? {});
+    const ok = verifyWebhookSignature(rawBody, sig);
+    if (!ok) return reply.code(401).send({ error: 'invalid_signature' });
+
+    const body = (req.body ?? {}) as {
+      eventId?: string;
+      type?: string;
+      provider?: string;
+      occurredAt?: string;
+      data?: Record<string, unknown>;
+    };
+    if (!body.eventId || !body.type) {
+      return reply.code(400).send({ error: 'eventId_type_required' });
+    }
+    const provider = body.provider ?? config.payoutProvider;
+    const data = body.data ?? {};
+    const developerId = typeof data.developerId === 'string' ? data.developerId : null;
+    const advanceId = typeof data.advanceId === 'string' ? data.advanceId : null;
+
+    const insWebhook = await pool.query(
+      `insert into webhook_events (provider, event_id, event_type, developer_id, signature_valid, payload)
+       values ($1,$2,$3,$4,true,$5::jsonb)
+       on conflict (provider, event_id) do nothing`,
+      [provider, body.eventId, body.type, developerId, JSON.stringify(body)],
+    );
+    if (insWebhook.rowCount === 0) return { ok: true, duplicate: true };
+
+    if (developerId && advanceId && body.type === 'settlement.posted') {
+      const amountCents = Number(data.amountCents ?? 0);
+      if (amountCents > 0) {
+        const se = await pool.query<{ id: string }>(
+          `insert into settlement_events (
+             developer_id, advance_id, provider, provider_event_id, amount_cents,
+             principal_applied_cents, fee_applied_cents, event_occurred_at, raw_payload
+           ) values ($1,$2,$3,$4,$5,0,0,$6,$7::jsonb)
+           on conflict (provider, provider_event_id) do update set raw_payload = excluded.raw_payload
+           returning id`,
+          [developerId, advanceId, provider, body.eventId, amountCents, body.occurredAt ?? new Date().toISOString(), JSON.stringify(body)],
+        );
+        if (se.rowCount === 1) {
+          await settlementQueue.add('settlement-reconcile', { settlementEventId: se.rows[0]!.id }, { removeOnComplete: 1000, removeOnFail: 5000 });
+        }
+      }
+    }
+
+    await pool.query(
+      `update webhook_events set processed_at = now(), processing_status = 'processed'
+       where provider = $1 and event_id = $2`,
+      [provider, body.eventId],
+    );
+    return { ok: true };
   });
 
   app.get('/v1/pricing-transparency', { preHandler: authMiddleware }, async (req, reply) => {
@@ -494,7 +594,7 @@ export async function registerPayoutAdvancePricingRoutes(app: FastifyInstance): 
           await finishIdempotent(developerId, '/v1/advances/:id/transition', idempotencyKey, 409, outBody);
           return reply.code(409).send(outBody);
         }
-        const disb = await postStubDisbursement(client, id, developerId, amountCents - feeCents);
+        const disb = await dispatchDisbursement(client, id, developerId, amountCents - feeCents);
         if (!disb.ok) {
           await client.query(
             `insert into payout_disbursements
@@ -646,8 +746,13 @@ export async function registerPayoutAdvancePricingRoutes(app: FastifyInstance): 
         }
         const principalRemaining = Math.max(0, Number(row.amount_cents) - Number(row.principal_repaid_cents));
         const feeRemaining = Math.max(0, Number(row.fee_cents) - Number(row.fee_repaid_cents));
-        const principalAppliedCents = Math.min(amountCents, principalRemaining);
-        const feeAppliedCents = Math.min(amountCents - principalAppliedCents, feeRemaining);
+        const allocation = allocateSettlement({
+          amountCents,
+          principalRemainingCents: principalRemaining,
+          feeRemainingCents: feeRemaining,
+        });
+        const principalAppliedCents = allocation.principalAppliedCents;
+        const feeAppliedCents = allocation.feeAppliedCents;
         const applied = principalAppliedCents + feeAppliedCents;
 
         let duplicate = false;
@@ -655,9 +760,9 @@ export async function registerPayoutAdvancePricingRoutes(app: FastifyInstance): 
           const settled = await client.query(
             `insert into settlement_events (
                developer_id, advance_id, provider, provider_event_id, amount_cents,
-               principal_applied_cents, fee_applied_cents, event_occurred_at, raw_payload
+               principal_applied_cents, fee_applied_cents, event_occurred_at, raw_payload, reconciliation_state
              )
-             values ($1,$2,'apple_settlement',$3,$4,$5,$6,$7,$8::jsonb)
+             values ($1,$2,'apple_settlement',$3,$4,$5,$6,$7,$8::jsonb,'pending')
              on conflict (provider, provider_event_id) do nothing`,
             [
               developerId,
@@ -674,9 +779,9 @@ export async function registerPayoutAdvancePricingRoutes(app: FastifyInstance): 
         } else {
           await client.query(
             `insert into settlement_events (
-               developer_id, advance_id, provider, amount_cents, principal_applied_cents, fee_applied_cents, event_occurred_at, raw_payload
+               developer_id, advance_id, provider, amount_cents, principal_applied_cents, fee_applied_cents, event_occurred_at, raw_payload, reconciliation_state
              )
-             values ($1,$2,'apple_settlement',$3,$4,$5,$6,$7::jsonb)`,
+             values ($1,$2,'apple_settlement',$3,$4,$5,$6,$7::jsonb,'pending')`,
             [
               developerId,
               advanceId,
@@ -692,6 +797,12 @@ export async function registerPayoutAdvancePricingRoutes(app: FastifyInstance): 
           results.push({ advanceId, status: 'duplicate_provider_event' });
           continue;
         }
+        await client.query(
+          `update settlement_events
+           set reconciliation_state = 'applied', reconciled_at = now(), reconcile_error = null
+           where developer_id = $1 and advance_id = $2 and provider = 'apple_settlement' and provider_event_id is not distinct from $3`,
+          [developerId, advanceId, ev.providerEventId ?? null],
+        );
         if (applied > 0) {
           await client.query(
             `update advances
@@ -746,6 +857,40 @@ export async function registerPayoutAdvancePricingRoutes(app: FastifyInstance): 
     } finally {
       client.release();
     }
+  });
+
+  app.post('/v1/settlements/ingest', { preHandler: authMiddleware }, async (req, reply) => {
+    const { developerId } = (req as AuthedRequest).auth;
+    const body = (req.body ?? {}) as {
+      events?: Array<{ advanceId?: string; amountCents?: number; providerEventId?: string; occurredAt?: string; rawPayload?: Record<string, unknown> }>;
+    };
+    if (!Array.isArray(body.events) || body.events.length === 0) {
+      return reply.code(400).send({ error: 'events_required' });
+    }
+    const out: Array<Record<string, unknown>> = [];
+    for (const ev of body.events) {
+      const advanceId = ev.advanceId ?? '';
+      const amountCents = Number(ev.amountCents);
+      if (!advanceId || !Number.isFinite(amountCents) || amountCents <= 0) {
+        out.push({ advanceId, status: 'invalid_event' });
+        continue;
+      }
+      const ins = await pool.query<{ id: string }>(
+        `insert into settlement_events (
+           developer_id, advance_id, provider, provider_event_id, amount_cents, principal_applied_cents, fee_applied_cents, event_occurred_at, raw_payload, reconciliation_state
+         ) values ($1,$2,'apple_settlement',$3,$4,0,0,$5,$6::jsonb,'pending')
+         on conflict (provider, provider_event_id) do nothing
+         returning id`,
+        [developerId, advanceId, ev.providerEventId ?? null, amountCents, ev.occurredAt ?? new Date().toISOString(), JSON.stringify(ev.rawPayload ?? {})],
+      );
+      if (ins.rowCount !== 1) {
+        out.push({ advanceId, status: 'duplicate_provider_event' });
+        continue;
+      }
+      await settlementQueue.add('settlement-reconcile', { settlementEventId: ins.rows[0]!.id }, { removeOnComplete: 1000, removeOnFail: 5000 });
+      out.push({ advanceId, status: 'queued', settlementEventId: ins.rows[0]!.id });
+    }
+    return { ok: true, results: out };
   });
 
   app.get('/v1/advances/reporting/outstanding', { preHandler: authMiddleware }, async (req, reply) => {
@@ -819,5 +964,38 @@ export async function registerPayoutAdvancePricingRoutes(app: FastifyInstance): 
       });
     }
     return { days, series };
+  });
+
+  app.get('/v1/advances/reporting/summary', { preHandler: authMiddleware }, async (req, reply) => {
+    const { developerId } = (req as AuthedRequest).auth;
+    const r = await pool.query<{
+      principal_outstanding_cents: string;
+      fee_outstanding_cents: string;
+      fee_realized_cents: string;
+      principal_repaid_cents: string;
+      funded_count: string;
+      repaid_count: string;
+    }>(
+      `select
+         coalesce(sum(greatest(a.amount_cents - a.principal_repaid_cents, 0)),0)::text as principal_outstanding_cents,
+         coalesce(sum(greatest(a.fee_cents - a.fee_repaid_cents, 0)),0)::text as fee_outstanding_cents,
+         coalesce(sum(a.fee_repaid_cents),0)::text as fee_realized_cents,
+         coalesce(sum(a.principal_repaid_cents),0)::text as principal_repaid_cents,
+         coalesce(sum(case when a.status = 'funded' then 1 else 0 end),0)::text as funded_count,
+         coalesce(sum(case when a.status = 'repaid' then 1 else 0 end),0)::text as repaid_count
+       from advances a
+       where a.developer_id = $1`,
+      [developerId],
+    );
+    const x = r.rows[0]!;
+    return {
+      principalOutstandingCents: Number(x.principal_outstanding_cents),
+      feeOutstandingCents: Number(x.fee_outstanding_cents),
+      totalOutstandingCents: Number(x.principal_outstanding_cents) + Number(x.fee_outstanding_cents),
+      feeRealizedCents: Number(x.fee_realized_cents),
+      principalRepaidCents: Number(x.principal_repaid_cents),
+      fundedCount: Number(x.funded_count),
+      repaidCount: Number(x.repaid_count),
+    };
   });
 }

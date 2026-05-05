@@ -29,3 +29,17 @@ export function computeAdvanceQuote(amountCents: number): {
     effectiveAprProxyBps: aprProxyBps(feeCents, amountCents, IMPLIED_HOLD_DAYS_DEFAULT),
   };
 }
+
+export function allocateSettlement(params: {
+  amountCents: number;
+  principalRemainingCents: number;
+  feeRemainingCents: number;
+}): { principalAppliedCents: number; feeAppliedCents: number; unappliedCents: number } {
+  const amountCents = Math.max(0, params.amountCents);
+  const principalRemainingCents = Math.max(0, params.principalRemainingCents);
+  const feeRemainingCents = Math.max(0, params.feeRemainingCents);
+  const principalAppliedCents = Math.min(amountCents, principalRemainingCents);
+  const feeAppliedCents = Math.min(amountCents - principalAppliedCents, feeRemainingCents);
+  const unappliedCents = Math.max(0, amountCents - principalAppliedCents - feeAppliedCents);
+  return { principalAppliedCents, feeAppliedCents, unappliedCents };
+}

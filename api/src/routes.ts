@@ -168,6 +168,33 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
     return { decision: lim.rows[0] };
   });
 
+  app.get('/v1/ops/metrics', { preHandler: authMiddleware }, async (req, reply) => {
+    const { developerId } = (req as AuthedRequest).auth;
+    const k = await pool.query<{
+      pending_settlements: string;
+      failed_settlements: string;
+      failed_disbursements: string;
+      stale_ingestions_72h: string;
+      idempotency_replays_24h: string;
+    }>(
+      `select
+         (select count(*)::text from settlement_events where developer_id = $1 and reconciliation_state = 'pending') as pending_settlements,
+         (select count(*)::text from settlement_events where developer_id = $1 and reconciliation_state = 'failed') as failed_settlements,
+         (select count(*)::text from payout_disbursements where developer_id = $1 and status = 'failed') as failed_disbursements,
+         (select count(*)::text from ingestion_runs where developer_id = $1 and created_at < now() - interval '72 hours' and status != 'succeeded') as stale_ingestions_72h,
+         (select count(*)::text from idempotency_keys where developer_id = $1 and created_at >= now() - interval '24 hours' and status = 'completed') as idempotency_replays_24h`,
+      [developerId],
+    );
+    const row = k.rows[0]!;
+    return {
+      pendingSettlements: Number(row.pending_settlements),
+      failedSettlements: Number(row.failed_settlements),
+      failedDisbursements: Number(row.failed_disbursements),
+      staleIngestions72h: Number(row.stale_ingestions_72h),
+      idempotencyCompletions24h: Number(row.idempotency_replays_24h),
+    };
+  });
+
   /** Dev-only: list raw files on disk for audit demos */
   app.get('/v1/debug/raw-tree', { preHandler: authMiddleware }, async (req, reply) => {
     if ((process.env.NODE_ENV ?? 'development') === 'production') {

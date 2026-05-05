@@ -38,6 +38,10 @@ export type PayoutProfile = {
   routingLast4: string | null;
   currency: string;
   verificationState: string;
+  provider?: string;
+  providerVerificationStatus?: string | null;
+  providerFailureCode?: string | null;
+  providerFailureMessage?: string | null;
   kycChecklist: {
     govId: boolean;
     proofOfAddress: boolean;
@@ -96,4 +100,14 @@ export type OutstandingSeriesPoint = {
   principalOutstandingCents: number;
   feeOutstandingCents: number;
   totalOutstandingCents: number;
+};
+
+export type OutstandingSummary = {
+  principalOutstandingCents: number;
+  feeOutstandingCents: number;
+  totalOutstandingCents: number;
+  feeRealizedCents: number;
+  principalRepaidCents: number;
+  fundedCount: number;
+  repaidCount: number;
 };

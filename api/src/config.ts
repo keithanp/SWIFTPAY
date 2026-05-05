@@ -11,4 +11,6 @@ export const config = {
   encryptionKey: process.env.ENCRYPTION_KEY ?? 'dev-insecure-change-me-32bytes!!',
   dataDir: process.env.DATA_DIR ?? path.resolve(__dirname, '../../data'),
   appleMock: (process.env.APPLE_MOCK ?? 'true').toLowerCase() === 'true',
+  payoutProvider: process.env.PAYOUT_PROVIDER ?? 'internal_stub',
+  payoutWebhookSecret: process.env.PAYOUT_WEBHOOK_SECRET ?? 'dev-webhook-secret',
 };
